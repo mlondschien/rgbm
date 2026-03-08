@@ -1,0 +1,14 @@
+[package]
+name = "rgbm-python"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "rgbm"
+crate-type = ["cdylib"]
+
+[dependencies]
+rgbm = { path = "../rgbm" }
+arrow = { workspace = true }
+pyo3 = { workspace = true }
+numpy = { workspace = true }
