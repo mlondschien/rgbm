@@ -7,3 +7,5 @@ edition = "2024"
 arrow = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
+rand = { workspace = true }
+ahash = { workspace = true }

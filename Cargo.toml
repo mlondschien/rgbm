@@ -6,8 +6,10 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-arrow = { version = "54", features = ["pyarrow"] }
+arrow = { version = "54" }
 rayon = "1.10"
+rand = "0.8"
+ahash = "0.8"
 thiserror = "2"
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py311"] }
 numpy = "0.23"

@@ -9,6 +9,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 rgbm = { path = "../rgbm" }
-arrow = { workspace = true }
+arrow = { workspace = true, features = ["pyarrow"] }
 pyo3 = { workspace = true }
 numpy = { workspace = true }
