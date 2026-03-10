@@ -6,15 +6,8 @@ use arrow::array::{Array, DictionaryArray, Float64Array, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, UInt32Type};
 use arrow::error::ArrowError;
-use thiserror::Error;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-
-#[derive(Error, Debug)]
-pub enum BinError {
-    #[error("max_number_of_bins must be at least 1, got {0}")]
-    InvalidMaxNumberOfBins(usize),
-}
 
 /// Bin boundaries for a single feature. The last boundary is always +inf.
 /// A value `x` maps to bin `i` if `i` is maximal s.t. `x <= upper_bounds[i]`.
@@ -30,10 +23,8 @@ impl BinMapper {
         values: &Float64Array,
         num_bins: usize,
         min_data_in_bin: usize,
-    ) -> Result<Self, BinError> {
-        if num_bins == 0 {
-            return Err(BinError::InvalidMaxNumberOfBins(num_bins));
-        }
+    ) -> Self {
+        assert!(num_bins > 0, "num_bins must be at least 1, got {num_bins}");
 
         let mut valid: Vec<f64> = values.iter().flatten().filter(|x| !x.is_nan()).collect();
 
@@ -53,9 +44,9 @@ impl BinMapper {
 
         valid.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
-        Ok(Self {
+        Self {
             upper_bounds: Self::greedy_find_bins(&valid, num_bins, min_data_in_bin),
-        })
+        }
     }
 
     /// Map a single value to its bin index via binary search.
@@ -236,7 +227,7 @@ mod tests {
     #[test]
     fn test_few_distinct_values() {
         let arr = make_array(&[1.0, 2.0, 3.0, 1.0, 2.0]);
-        let mapper = BinMapper::from_array(&arr, 255, 1).unwrap();
+        let mapper = BinMapper::from_array(&arr, 255, 1);
         assert_eq!(mapper.num_bins(), 3);
         assert_eq!(mapper.value_to_bin(1.0), 0);
         assert_eq!(mapper.value_to_bin(2.0), 1);
@@ -246,14 +237,14 @@ mod tests {
     #[test]
     fn test_max_number_of_bins_limits_bins() {
         let values: Vec<f64> = (0..100).map(|i| i as f64).collect();
-        let mapper = BinMapper::from_array(&make_array(&values), 10, 1).unwrap();
+        let mapper = BinMapper::from_array(&make_array(&values), 10, 1);
         assert!(mapper.num_bins() <= 10);
     }
 
     #[test]
     fn test_monotone_bin_assignment() {
         let values: Vec<f64> = (0..1000).map(|i| i as f64 * 0.1).collect();
-        let mapper = BinMapper::from_array(&make_array(&values), 32, 1).unwrap();
+        let mapper = BinMapper::from_array(&make_array(&values), 32, 1);
         let bins = mapper.array_to_bins(&make_array(&values));
         for w in bins.windows(2) {
             assert!(w[0] <= w[1], "bins not monotone: {} > {}", w[0], w[1]);
@@ -263,15 +254,16 @@ mod tests {
     #[test]
     fn test_null_nan_sentinel() {
         let arr = Float64Array::from(vec![Some(1.0), None, Some(f64::NAN)]);
-        let mapper = BinMapper::from_array(&arr, 255, 1).unwrap();
+        let mapper = BinMapper::from_array(&arr, 255, 1);
         let bins = mapper.array_to_bins(&arr);
         assert_eq!(bins[1], mapper.num_bins() as u32);
         assert_eq!(bins[2], mapper.num_bins() as u32);
     }
 
     #[test]
+    #[should_panic(expected = "num_bins must be at least 1")]
     fn test_invalid_max_number_of_bins() {
-        assert!(BinMapper::from_array(&make_array(&[1.0, 2.0]), 0, 1).is_err());
+        BinMapper::from_array(&make_array(&[1.0, 2.0]), 0, 1);
     }
 
     #[test]
@@ -281,7 +273,7 @@ mod tests {
             .iter()
             .flat_map(|&(v, n)| std::iter::repeat(v).take(n))
             .collect();
-        let mapper = BinMapper::from_array(&make_array(&values), 3, 1).unwrap();
+        let mapper = BinMapper::from_array(&make_array(&values), 3, 1);
         assert_eq!(mapper.num_bins(), 3);
         assert_eq!(mapper.value_to_bin(2.0), 0);
         assert_eq!(mapper.value_to_bin(3.0), 1);
@@ -292,8 +284,8 @@ mod tests {
     fn test_min_data_in_bin_reduces_bin_count() {
         let values: Vec<f64> = (0..100).map(|i| i as f64).collect();
         let arr = make_array(&values);
-        let strict = BinMapper::from_array(&arr, 255, 10).unwrap();
-        let loose = BinMapper::from_array(&arr, 255, 1).unwrap();
+        let strict = BinMapper::from_array(&arr, 255, 10);
+        let loose = BinMapper::from_array(&arr, 255, 1);
         assert!(strict.num_bins() <= loose.num_bins());
     }
 }
