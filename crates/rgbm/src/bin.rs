@@ -2,12 +2,13 @@
 
 use ahash::AHashMap;
 
-use arrow::array::{Array, DictionaryArray, Float64Array, StringArray};
+use arrow::array::{Array, AsArray, Float64Array};
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, UInt32Type};
+use arrow::datatypes::{DataType, Float64Type, UInt32Type};
 use arrow::error::ArrowError;
 use rand::rngs::StdRng;
-use rand::SeedableRng;
+use rand::{SeedableRng};
+use rand::seq::IteratorRandom;
 
 /// Bin boundaries for a single feature. The last boundary is always +inf.
 /// A value `x` maps to bin `i` if `i` is maximal s.t. `x <= upper_bounds[i]`.
@@ -26,21 +27,15 @@ impl BinMapper {
     ) -> Self {
         assert!(num_bins > 0, "num_bins must be at least 1, got {num_bins}");
 
-        let mut valid: Vec<f64> = values.iter().flatten().filter(|x| !x.is_nan()).collect();
-
-        // Subsample using a simple step function if exceeding the LightGBM default
-        let max_sample = 200_000;
-        if valid.len() > max_sample {
-            // TODO: use booster's seed once we have it
-            let mut rng = StdRng::seed_from_u64(0);
-            
-            // Extract the indices into a Vec and sort them
-            let mut indices = rand::seq::index::sample(&mut rng, valid.len(), max_sample).into_vec();
-            indices.sort_unstable();  // sort to make memory accesses more sequential
-            
-            // Now memory access is 100% sequential
-            valid = indices.into_iter().map(|i| valid[i]).collect();
-        }
+        // Reservoir sampling: O(max_sample) instead of O(n)
+        // todo: use booster's seed once we have it
+        const MAX_SAMPLE: usize = 200_000;  // from LGBM
+        let mut rng = StdRng::seed_from_u64(0);
+        let mut valid = values
+            .iter()
+            .flatten()
+            .filter(|x| !x.is_nan())
+            .choose_multiple(&mut rng, MAX_SAMPLE);
 
         valid.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
@@ -52,18 +47,6 @@ impl BinMapper {
     /// Map a single value to its bin index via binary search.
     pub fn value_to_bin(&self, value: f64) -> u32 {
         self.upper_bounds.partition_point(|&bound| bound < value) as u32
-    }
-
-    /// Map a Float64Array to bin indices. Nulls and NaNs get a sentinel index
-    /// one past the last bin.
-    pub fn array_to_bins(&self, values: &Float64Array) -> Vec<u32> {
-        values
-            .iter()
-            .map(|v| match v {
-                Some(x) if !x.is_nan() => self.value_to_bin(x),
-                _ => self.sentinel(),
-            })
-            .collect()
     }
 
     /// Greedy bin boundary search over sorted values.
@@ -134,15 +117,20 @@ pub struct CatMapper {
 }
 
 impl CatMapper {
-    /// Build a CatMapper from a `Dictionary(UInt32, Utf8)` Arrow array.
+    /// Build a CatMapper from any Arrow Dictionary array.
     ///
-    /// `values[k]` is the category string for key `k`. We build the reverse map `category → k`.
-    /// Null entries in the dictionary values (unnamed categories) are skipped.
-    pub fn from_dictionary(array: &DictionaryArray<UInt32Type>) -> Self {
-        let values = array.values().as_any().downcast_ref::<StringArray>().unwrap();
+    pub fn from_dictionary(array: &dyn Array) -> Self {
+        let casted = cast(
+            array,
+            &DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+        ).unwrap();
+        
+        let dict = casted.as_dictionary::<UInt32Type>();
+        let values = dict.values().as_string::<i32>();
+        
         let mut categories_to_bins = AHashMap::new();
         for i in 0..values.len() {
-            if values.is_valid(i) { // skip null dictionary entries (unnamed categories)
+            if values.is_valid(i) {
                 categories_to_bins.insert(values.value(i).to_string(), i as u32);
             }
         }
@@ -179,11 +167,16 @@ impl Binner for BinMapper {
     }
 
     fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u32>, ArrowError> {
-        let values = array
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or_else(|| ArrowError::CastError("expected Float64Array".into()))?;
-        Ok(self.array_to_bins(values))
+        let values = array.as_primitive_opt::<Float64Type>()
+            .ok_or(ArrowError::CastError("expected Float64Array".into()))?;
+
+        Ok(values
+            .iter()
+            .map(|v| match v {
+                Some(x) if !x.is_nan() => self.value_to_bin(x),
+                _ => self.sentinel(),
+            })
+            .collect())
     }
 }
 
@@ -193,23 +186,24 @@ impl Binner for CatMapper {
     }
 
     fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u32>, ArrowError> {
+        // todo: This makes a copy. Since we use the bins only to create histograms
+        // in the next step, it should be possible to avoid the copy.
         let casted = cast(
             array,
             &DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
         )?;
-        let dict = casted.as_any().downcast_ref::<DictionaryArray<UInt32Type>>().unwrap();
-        let values = dict.values().as_any().downcast_ref::<StringArray>().unwrap();
-        let keys = dict.keys();
+        
+        // AsArray cuts out the downcast_ref boilerplate
+        let dict = casted.as_dictionary::<UInt32Type>();
+        let values = dict.values().as_string::<i32>();
         let sentinel = self.sentinel();
 
-        // Build a translation table from incoming dictionary keys to bin indices.
-        // Only hashes strings K times (number of unique categories), not N times (number of rows).
         let key_to_bin: Vec<u32> = values
             .iter()
-            .map(|v| v.and_then(|s| self.categories_to_bins.get(s).copied()).unwrap_or(sentinel))
+            .map(|v| v.and_then(|s| self.categories_to_bins.get(s)).copied().unwrap_or(sentinel))
             .collect();
 
-        Ok(keys
+        Ok(dict.keys()
             .iter()
             .map(|k| k.map_or(sentinel, |k| key_to_bin[k as usize]))
             .collect())
@@ -245,7 +239,7 @@ mod tests {
     fn test_monotone_bin_assignment() {
         let values: Vec<f64> = (0..1000).map(|i| i as f64 * 0.1).collect();
         let mapper = BinMapper::from_array(&make_array(&values), 32, 1);
-        let bins = mapper.array_to_bins(&make_array(&values));
+        let bins = mapper.array_to_bins(&make_array(&values)).unwrap();
         for w in bins.windows(2) {
             assert!(w[0] <= w[1], "bins not monotone: {} > {}", w[0], w[1]);
         }
@@ -255,7 +249,7 @@ mod tests {
     fn test_null_nan_sentinel() {
         let arr = Float64Array::from(vec![Some(1.0), None, Some(f64::NAN)]);
         let mapper = BinMapper::from_array(&arr, 255, 1);
-        let bins = mapper.array_to_bins(&arr);
+        let bins = mapper.array_to_bins(&arr).unwrap();
         assert_eq!(bins[1], mapper.num_bins() as u32);
         assert_eq!(bins[2], mapper.num_bins() as u32);
     }
