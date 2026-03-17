@@ -18,7 +18,7 @@ impl Binner for FeatureBinner {
         }
     }
 
-    fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u32>, ArrowError> {
+    fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u16>, ArrowError> {
         match self {
             Self::Numeric(b) => b.array_to_bins(array),
             Self::Categorical(b) => b.array_to_bins(array),
@@ -29,7 +29,7 @@ impl Binner for FeatureBinner {
 /// Training dataset: stores binned features, labels, and optional weights.
 pub struct Dataset {
     /// `binned_features[j][i]` is the bin index for row `i`, feature `j`.
-    pub binned_features: Vec<Vec<u32>>,
+    pub binned_features: Vec<Vec<u16>>,
     pub feature_binners: Vec<FeatureBinner>,
     pub feature_names: Vec<String>,
     pub labels: Float64Array,

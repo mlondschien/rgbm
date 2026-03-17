@@ -45,8 +45,8 @@ impl BinMapper {
     }
 
     /// Map a single value to its bin index via binary search.
-    pub fn value_to_bin(&self, value: f64) -> u32 {
-        self.upper_bounds.partition_point(|&bound| bound < value) as u32
+    pub fn value_to_bin(&self, value: f64) -> u16 {
+        self.upper_bounds.partition_point(|&bound| bound < value) as u16
     }
 
     /// Greedy bin boundary search over sorted values.
@@ -113,33 +113,29 @@ impl BinMapper {
 /// tree follows a predetermined direction at each split.
 pub struct CatMapper {
     /// Maps each category string to its bin index (its position in the training dictionary).
-    pub categories_to_bins: AHashMap<String, u32>,
+    pub categories_to_bins: AHashMap<String, u16>,
 }
 
 impl CatMapper {
     /// Build a CatMapper from any Arrow Dictionary array.
-    ///
+    /// Avoid a copy of the entire column.
     pub fn from_dictionary(array: &dyn Array) -> Self {
-        let casted = cast(
-            array,
-            &DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
-        ).unwrap();
-        
-        let dict = casted.as_dictionary::<UInt32Type>();
+        let dict = array.as_any_dictionary();        
         let values = dict.values().as_string::<i32>();
         
         let mut categories_to_bins = AHashMap::new();
         for i in 0..values.len() {
             if values.is_valid(i) {
-                categories_to_bins.insert(values.value(i).to_string(), i as u32);
+                categories_to_bins.insert(values.value(i).to_string(), i as u16);
             }
         }
+        
         Self { categories_to_bins }
     }
 
     /// Map a single category string to its bin index.
     /// Unknown categories (unseen during training) map to the sentinel index `num_bins()`.
-    pub fn value_to_bin(&self, value: &str) -> u32 {
+    pub fn value_to_bin(&self, value: &str) -> u16 {
         *self.categories_to_bins
             .get(value)
             .unwrap_or(&self.sentinel())
@@ -152,13 +148,13 @@ pub trait Binner {
     fn num_bins(&self) -> usize;
 
     /// Sentinel bin index for missing/unknown values, equal to `num_bins()`.
-    fn sentinel(&self) -> u32 {
-        self.num_bins() as u32
+    fn sentinel(&self) -> u16 {
+        self.num_bins() as u16
     }
 
     /// Map an Arrow array to bin indices. For `BinMapper`, expects a `Float64Array`;
     /// for `CatMapper`, expects any Dictionary array (casts to Dictionary(UInt32, Utf8)).
-    fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u32>, ArrowError>;
+    fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u16>, ArrowError>;
 }
 
 impl Binner for BinMapper {
@@ -166,7 +162,7 @@ impl Binner for BinMapper {
         self.upper_bounds.len()
     }
 
-    fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u32>, ArrowError> {
+    fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u16>, ArrowError> {
         let values = array.as_primitive_opt::<Float64Type>()
             .ok_or(ArrowError::CastError("expected Float64Array".into()))?;
 
@@ -185,20 +181,20 @@ impl Binner for CatMapper {
         self.categories_to_bins.len()
     }
 
-    fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u32>, ArrowError> {
+    fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u16>, ArrowError> {
         // todo: This makes a copy. Since we use the bins only to create histograms
         // in the next step, it should be possible to avoid the copy.
         let casted = cast(
             array,
             &DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
         )?;
-        
+
         // AsArray cuts out the downcast_ref boilerplate
         let dict = casted.as_dictionary::<UInt32Type>();
         let values = dict.values().as_string::<i32>();
         let sentinel = self.sentinel();
 
-        let key_to_bin: Vec<u32> = values
+        let key_to_bin: Vec<u16> = values
             .iter()
             .map(|v| v.and_then(|s| self.categories_to_bins.get(s)).copied().unwrap_or(sentinel))
             .collect();
@@ -250,8 +246,8 @@ mod tests {
         let arr = Float64Array::from(vec![Some(1.0), None, Some(f64::NAN)]);
         let mapper = BinMapper::from_array(&arr, 255, 1);
         let bins = mapper.array_to_bins(&arr).unwrap();
-        assert_eq!(bins[1], mapper.num_bins() as u32);
-        assert_eq!(bins[2], mapper.num_bins() as u32);
+        assert_eq!(bins[1], mapper.num_bins() as u16);
+        assert_eq!(bins[2], mapper.num_bins() as u16);
     }
 
     #[test]
