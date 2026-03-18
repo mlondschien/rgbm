@@ -4,3 +4,4 @@ pub mod dataset;
 pub mod histogram;
 pub mod objective;
 pub mod tree;
+pub mod utils;
