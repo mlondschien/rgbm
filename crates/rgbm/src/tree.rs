@@ -1,12 +1,11 @@
 use rayon::prelude::*;
 
-use arrow::array::{AsArray, DictionaryArray};
+use arrow::array::{Array, PrimitiveArray};
 use arrow::datatypes::{Float64Type, UInt32Type};
-use arrow::record_batch::RecordBatch;
 
-use crate::bin::Binner;
 use crate::dataset::{Dataset, FeatureBinner};
-use crate::histogram::{Histogram, HistogramBin, Parameters, Scratch, SplitInfo, Threshold};
+use crate::histogram::{Histogram, HistogramBin, Scratch, SplitInfo, Threshold};
+use crate::parameters::Parameters;
 use crate::utils::{calculate_score, calculate_weight};
 
 #[derive(Clone)]
@@ -31,29 +30,43 @@ pub struct Tree {
 }
 
 impl Tree {
-    pub fn predict(&self, batch: &RecordBatch) -> Vec<f64> {
-        let mut scores = vec![0.0; batch.num_rows()];
-        for (row, score) in scores.iter_mut().enumerate() {
-            let mut idx = 0;
-            loop {
-                let node = &self.nodes[idx];
-                if node.is_leaf { *score = node.value; break; }
-                let col = batch.column(node.split_feature);
-                let goes_left = if col.is_null(row) {
-                    node.missing_goes_left
-                } else {
-                    match &node.threshold {
-                        FinalThreshold::Numeric(t) => col.as_primitive::<Float64Type>().value(row) <= *t,
-                        FinalThreshold::Categorical(gl) => {
-                            let key = col.as_any().downcast_ref::<DictionaryArray<UInt32Type>>().unwrap().keys().value(row) as usize;
-                            gl[key]
-                        }
+    /// Zero-allocation, lock-free evaluation of a single row.
+    /// Columns are pre-extracted in `Booster::predict` to avoid repeated downcasting.
+    #[inline(always)]
+    pub fn predict_row(
+        &self,
+        row: usize,
+        numeric_columns: &[Option<&PrimitiveArray<Float64Type>>],
+        categorical_columns: &[Option<&PrimitiveArray<UInt32Type>>],
+    ) -> f64 {
+        let mut idx = 0;
+        loop {
+            let node = &self.nodes[idx];
+            if node.is_leaf { return node.value; }
+
+            let goes_left = match &node.threshold {
+                FinalThreshold::Numeric(t) => {
+                    let col = numeric_columns[node.split_feature].unwrap();
+                    if col.is_null(row) {
+                        node.missing_goes_left
+                    } else {
+                        let val = col.value(row);
+                        if val.is_nan() { node.missing_goes_left } else { val <= *t }
                     }
-                };
-                idx = if goes_left { node.left_child } else { node.right_child };
-            }
+                }
+                FinalThreshold::Categorical(gl) => {
+                    let col = categorical_columns[node.split_feature].unwrap();
+                    if col.is_null(row) {
+                        node.missing_goes_left
+                    } else {
+                        let cat_idx = col.value(row) as usize;
+                        if cat_idx < gl.len() { gl[cat_idx] } else { node.missing_goes_left }
+                    }
+                }
+            };
+
+            idx = if goes_left { node.left_child } else { node.right_child };
         }
-        scores
     }
 }
 
@@ -231,4 +244,91 @@ impl<'a> TreeBuilder<'a> {
         lo
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Float64Array, UInt32Array};
+
+    fn leaf(value: f64) -> TreeNode {
+        TreeNode { is_leaf: true, left_child: 0, right_child: 0, split_feature: 0,
+            threshold: FinalThreshold::Numeric(0.0), missing_goes_left: false, value }
+    }
+
+    fn numeric_split(feature: usize, threshold: f64, left_child: usize, right_child: usize, missing_goes_left: bool) -> TreeNode {
+        TreeNode { is_leaf: false, left_child, right_child, split_feature: feature,
+            threshold: FinalThreshold::Numeric(threshold), missing_goes_left, value: 0.0 }
+    }
+
+    fn predict(tree: &Tree, numeric: &[Option<Float64Array>], categorical: &[Option<UInt32Array>], row: usize) -> f64 {
+        let nc: Vec<Option<&PrimitiveArray<Float64Type>>> = numeric.iter().map(|a| a.as_ref().map(|a| a as _)).collect();
+        let cc: Vec<Option<&PrimitiveArray<UInt32Type>>> = categorical.iter().map(|a| a.as_ref().map(|a| a as _)).collect();
+        tree.predict_row(row, &nc, &cc)
+    }
+
+    #[test]
+    fn test_predict_numeric_stump() {
+        // feature 0 <= 0.5 → -1.0, else → 1.0
+        let tree = Tree { nodes: vec![
+            numeric_split(0, 0.5, 1, 2, false),
+            leaf(-1.0),
+            leaf(1.0),
+        ]};
+        let col = vec![Some(Float64Array::from(vec![0.0, 1.0]))];
+        let cat: Vec<Option<UInt32Array>> = vec![None];
+        assert_eq!(predict(&tree, &col, &cat, 0), -1.0);
+        assert_eq!(predict(&tree, &col, &cat, 1),  1.0);
+    }
+
+    #[test]
+    fn test_predict_missing_goes_left() {
+        let tree = Tree { nodes: vec![
+            numeric_split(0, 0.5, 1, 2, true),   // missing → left
+            leaf(-1.0),
+            leaf(1.0),
+        ]};
+        // row 0: null → missing_goes_left → -1.0
+        let col = vec![Some(Float64Array::from(vec![None as Option<f64>]))];
+        let cat: Vec<Option<UInt32Array>> = vec![None];
+        assert_eq!(predict(&tree, &col, &cat, 0), -1.0);
+    }
+
+    #[test]
+    fn test_predict_categorical() {
+        // categories 0 and 2 go left, category 1 goes right
+        let tree = Tree { nodes: vec![
+            TreeNode { is_leaf: false, left_child: 1, right_child: 2, split_feature: 0,
+                threshold: FinalThreshold::Categorical(vec![true, false, true]),
+                missing_goes_left: false, value: 0.0 },
+            leaf(-1.0),
+            leaf(1.0),
+        ]};
+        let num: Vec<Option<Float64Array>> = vec![None];
+        let keys = UInt32Array::from(vec![0u32, 1, 2]);
+        let cat = vec![Some(keys)];
+        assert_eq!(predict(&tree, &num, &cat, 0), -1.0); // cat 0 → left
+        assert_eq!(predict(&tree, &num, &cat, 1),  1.0); // cat 1 → right
+        assert_eq!(predict(&tree, &num, &cat, 2), -1.0); // cat 2 → left
+    }
+
+    #[test]
+    fn test_predict_deep_tree() {
+        // feature 0 splits at 0.5; left child splits feature 1 at 0.5
+        // [0,0]→-2, [0,1]→-1, [1,*]→1
+        let tree = Tree { nodes: vec![
+            numeric_split(0, 0.5, 1, 4, false),  // root: f0 <= 0.5 → node 1, else → node 4
+            numeric_split(1, 0.5, 2, 3, false),  // node 1: f1 <= 0.5 → node 2, else → node 3
+            leaf(-2.0),
+            leaf(-1.0),
+            leaf(1.0),
+        ]};
+        let f0 = Float64Array::from(vec![0.0, 0.0, 1.0]);
+        let f1 = Float64Array::from(vec![0.0, 1.0, 0.0]);
+        let col = vec![Some(f0), Some(f1)];
+        let cat: Vec<Option<UInt32Array>> = vec![None, None];
+        assert_eq!(predict(&tree, &col, &cat, 0), -2.0);
+        assert_eq!(predict(&tree, &col, &cat, 1), -1.0);
+        assert_eq!(predict(&tree, &col, &cat, 2),  1.0);
+    }
 }
