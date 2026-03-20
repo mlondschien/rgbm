@@ -1,7 +1,8 @@
 use rayon::prelude::*;
 
-use arrow::array::{AsArray, RecordBatch};
-use arrow::datatypes::Float64Type;
+use arrow::array::{AsArray, DictionaryArray};
+use arrow::datatypes::{Float64Type, UInt32Type};
+use arrow::record_batch::RecordBatch;
 
 use crate::bin::Binner;
 use crate::dataset::{Dataset, FeatureBinner};
@@ -29,6 +30,33 @@ pub struct Tree {
     pub nodes: Vec<TreeNode>,
 }
 
+impl Tree {
+    pub fn predict(&self, batch: &RecordBatch) -> Vec<f64> {
+        let mut scores = vec![0.0; batch.num_rows()];
+        for (row, score) in scores.iter_mut().enumerate() {
+            let mut idx = 0;
+            loop {
+                let node = &self.nodes[idx];
+                if node.is_leaf { *score = node.value; break; }
+                let col = batch.column(node.split_feature);
+                let goes_left = if col.is_null(row) {
+                    node.missing_goes_left
+                } else {
+                    match &node.threshold {
+                        FinalThreshold::Numeric(t) => col.as_primitive::<Float64Type>().value(row) <= *t,
+                        FinalThreshold::Categorical(gl) => {
+                            let key = col.as_any().downcast_ref::<DictionaryArray<UInt32Type>>().unwrap().keys().value(row) as usize;
+                            gl[key]
+                        }
+                    }
+                };
+                idx = if goes_left { node.left_child } else { node.right_child };
+            }
+        }
+        scores
+    }
+}
+
 pub struct TreeBuilder<'a> {
     pub parameters: &'a Parameters,
     pub nodes: Vec<TreeNode>,
@@ -44,9 +72,10 @@ impl<'a> TreeBuilder<'a> {
         }
     }
 
-    pub fn fit(&mut self, dataset: &Dataset, gradients: &[f64], hessians: &[f64]) -> Tree {
+    pub fn fit(&mut self, dataset: &Dataset, gradients: &[f64], hessians: &[f64]) -> (Tree, Vec<u32>) {
         self.nodes.clear();
         let mut indices: Vec<u32> = (0..dataset.num_rows as u32).collect();
+        let mut leaf_indices = vec![0u32; dataset.num_rows];
 
         let total_gradient: f64 = gradients.iter().sum();
         let total_hessian: f64 = hessians.iter().sum();
@@ -60,9 +89,9 @@ impl<'a> TreeBuilder<'a> {
                 .collect()
         });
 
-        self.build_node(pool, dataset, &mut indices, gradients, hessians, total_gradient, total_hessian, total_score, histograms, 0);
+        self.build_node(pool, dataset, &mut indices, gradients, hessians, total_gradient, total_hessian, total_score, histograms, 0, &mut leaf_indices);
 
-        Tree { nodes: self.nodes.clone() }
+        (Tree { nodes: self.nodes.clone() }, leaf_indices)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -78,31 +107,45 @@ impl<'a> TreeBuilder<'a> {
         total_score: f64,
         histograms: Vec<Histogram>,
         depth: usize,
+        leaf_indices: &mut [u32],
     ) -> usize {
         let p = self.parameters;
 
-        // 1. Stopping Criteria (using the new utility function)
+        // possibly stop early
         if depth >= p.max_depth || indices.len() < p.min_data_in_leaf * 2 || total_hessian < p.min_sum_hessian_in_leaf * 2.0 {
-            return self.add_leaf(calculate_weight(total_gradient, total_hessian, p.lambda_l1, p.lambda_l2));
+            let leaf_idx = self.add_leaf(calculate_weight(total_gradient, total_hessian, p.lambda_l1, p.lambda_l2));
+            for &row in indices.iter() { leaf_indices[row as usize] = leaf_idx as u32; }
+            return leaf_idx;
         }
 
         let best_split = pool.install(|| {
             (0..dataset.num_features)
                 .into_par_iter()
-                .filter_map(|f| {
-                    // TODO: This creates a new scratch for each feature. We could reuse
-                    // one within each thread.
-                    let mut scratch = Scratch::new(dataset.feature_binners[f].num_bins());
-                    histograms[f].find_best_numeric_split(
-                        total_gradient, total_hessian, indices.len() as u32, total_score, p, &mut scratch,
-                    ).map(|s| (f, s))
-                })
+                .map_init(
+                    || Scratch::new(dataset.max_bins),
+                    |scratch, f| {
+                        let split = match &dataset.feature_binners[f] {
+                            FeatureBinner::Numeric(_) => histograms[f].find_best_numeric_split(
+                                total_gradient, total_hessian, indices.len() as u32, total_score, p, scratch,
+                            ),
+                            FeatureBinner::Categorical(_) => histograms[f].find_best_categorical_split(
+                                total_gradient, total_hessian, indices.len() as u32, total_score, p, scratch,
+                            ),
+                        };
+                        split.map(|s| (f, s))
+                    },
+                )
+                .filter_map(|x| x)
                 .max_by(|a, b| a.1.gain.partial_cmp(&b.1.gain).unwrap())
         });
 
         let (best_f, split) = match best_split {
             Some(res) => res,
-            None => return self.add_leaf(calculate_weight(total_gradient, total_hessian, p.lambda_l1, p.lambda_l2)),
+            None => {
+                let leaf_idx = self.add_leaf(calculate_weight(total_gradient, total_hessian, p.lambda_l1, p.lambda_l2));
+                for &row in indices.iter() { leaf_indices[row as usize] = leaf_idx as u32; }
+                return leaf_idx;
+            }
         };
 
         let split_idx = self.partition_indices(dataset, indices, best_f, &split);
@@ -133,8 +176,8 @@ impl<'a> TreeBuilder<'a> {
             threshold: FinalThreshold::Numeric(0.0), missing_goes_left: false, value: 0.0,
         });
 
-        let left_child = self.build_node(pool, dataset, left_indices, gradients, hessians, split.left_gradient, split.left_hessian, split.left_score, left_hists, depth + 1);
-        let right_child = self.build_node(pool, dataset, right_indices, gradients, hessians, split.right_gradient, split.right_hessian, split.right_score, right_hists, depth + 1);
+        let left_child = self.build_node(pool, dataset, left_indices, gradients, hessians, split.left_gradient, split.left_hessian, split.left_score, left_hists, depth + 1, leaf_indices);
+        let right_child = self.build_node(pool, dataset, right_indices, gradients, hessians, split.right_gradient, split.right_hessian, split.right_score, right_hists, depth + 1, leaf_indices);
 
         let threshold = match &split.threshold {
             Threshold::Numeric(bin) => {
@@ -158,7 +201,8 @@ impl<'a> TreeBuilder<'a> {
         let idx = self.nodes.len();
         self.nodes.push(TreeNode {
             is_leaf: true, left_child: 0, right_child: 0, split_feature: 0,
-            threshold: FinalThreshold::Numeric(0.0), missing_goes_left: false, value,
+            threshold: FinalThreshold::Numeric(0.0), missing_goes_left: false,
+            value: value * self.parameters.learning_rate,
         });
         idx
     }

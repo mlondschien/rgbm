@@ -36,6 +36,7 @@ pub struct Dataset {
     pub weights: Option<Float64Array>,
     pub num_rows: usize,
     pub num_features: usize,
+    pub max_bins: usize,
 }
 
 impl Dataset {
@@ -69,6 +70,8 @@ impl Dataset {
             binned_features.push(bins);
         }
 
+        let max_bins = feature_binners.iter().map(|b| b.num_bins()).max().unwrap_or(num_bins);
+
         Self {
             binned_features,
             feature_binners,
@@ -77,6 +80,7 @@ impl Dataset {
             weights: weights.cloned(),
             num_rows: features.num_rows(),
             num_features,
+            max_bins,
         }
     }
 }

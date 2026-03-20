@@ -43,6 +43,8 @@ pub struct Parameters {
     pub min_sum_hessian_in_leaf: f64,
     pub max_depth: usize,
     pub njobs: usize,
+    pub num_iterations: usize,
+    pub learning_rate: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -388,7 +390,7 @@ mod tests {
     }
 
     fn default_parameters() -> Parameters {
-        Parameters { lambda_l1: 0.0, lambda_l2: 0.0, min_data_in_leaf: 1, min_sum_hessian_in_leaf: 0.0, max_depth: 6, njobs: 1 }
+        Parameters { lambda_l1: 0.0, lambda_l2: 0.0, min_data_in_leaf: 1, min_sum_hessian_in_leaf: 0.0, max_depth: 6, njobs: 1, num_iterations: 100, learning_rate: 0.1 }
     }
 
     #[test]
