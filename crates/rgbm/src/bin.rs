@@ -18,6 +18,20 @@ pub struct BinMapper {
 }
 
 impl BinMapper {
+    pub fn num_bins(&self) -> usize {
+        self.upper_bounds.len()
+    }
+
+    pub fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u16>, ArrowError> {
+        let sentinel = self.num_bins() as u16;
+        let values = array.as_primitive_opt::<Float64Type>()
+            .ok_or(ArrowError::CastError("expected Float64Array".into()))?;
+        Ok(values.iter().map(|v| match v {
+            Some(x) if !x.is_nan() => self.value_to_bin(x),
+            _ => sentinel,
+        }).collect())
+    }
+
     /// Build bin boundaries from a Float64Array. Nulls and NaNs are excluded
     /// from boundary construction and map to a sentinel bin beyond the last.
     pub fn from_array(
@@ -117,6 +131,28 @@ pub struct CatMapper {
 }
 
 impl CatMapper {
+    pub fn num_bins(&self) -> usize {
+        self.categories_to_bins.len()
+    }
+
+    pub fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u16>, ArrowError> {
+        let sentinel = self.num_bins() as u16;
+        let casted = cast(
+            array,
+            &DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+        )?;
+        let dict = casted.as_dictionary::<UInt32Type>();
+        let values = dict.values().as_string::<i32>();
+        let key_to_bin: Vec<u16> = values
+            .iter()
+            .map(|v| v.and_then(|s| self.categories_to_bins.get(s)).copied().unwrap_or(sentinel))
+            .collect();
+        Ok(dict.keys()
+            .iter()
+            .map(|k| k.map_or(sentinel, |k| key_to_bin[k as usize]))
+            .collect())
+    }
+
     /// Build a CatMapper from any Arrow Dictionary array.
     /// Avoid a copy of the entire column.
     pub fn from_dictionary(array: &dyn Array) -> Self {
@@ -138,73 +174,10 @@ impl CatMapper {
     pub fn value_to_bin(&self, value: &str) -> u16 {
         *self.categories_to_bins
             .get(value)
-            .unwrap_or(&self.sentinel())
+            .unwrap_or(&(self.num_bins() as u16))
     }
 }
 
-/// Common interface for numeric (`BinMapper`) and categorical (`CatMapper`) feature binners.
-pub trait Binner {
-    /// Total number of bins. Nulls and unknowns map to sentinel index `num_bins()`.
-    fn num_bins(&self) -> usize;
-
-    /// Sentinel bin index for missing/unknown values, equal to `num_bins()`.
-    fn sentinel(&self) -> u16 {
-        self.num_bins() as u16
-    }
-
-    /// Map an Arrow array to bin indices. For `BinMapper`, expects a `Float64Array`;
-    /// for `CatMapper`, expects any Dictionary array (casts to Dictionary(UInt32, Utf8)).
-    fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u16>, ArrowError>;
-}
-
-impl Binner for BinMapper {
-    fn num_bins(&self) -> usize {
-        self.upper_bounds.len()
-    }
-
-    fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u16>, ArrowError> {
-        let values = array.as_primitive_opt::<Float64Type>()
-            .ok_or(ArrowError::CastError("expected Float64Array".into()))?;
-
-        Ok(values
-            .iter()
-            .map(|v| match v {
-                Some(x) if !x.is_nan() => self.value_to_bin(x),
-                _ => self.sentinel(),
-            })
-            .collect())
-    }
-}
-
-impl Binner for CatMapper {
-    fn num_bins(&self) -> usize {
-        self.categories_to_bins.len()
-    }
-
-    fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u16>, ArrowError> {
-        // todo: This makes a copy. Since we use the bins only to create histograms
-        // in the next step, it should be possible to avoid the copy.
-        let casted = cast(
-            array,
-            &DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
-        )?;
-
-        // AsArray cuts out the downcast_ref boilerplate
-        let dict = casted.as_dictionary::<UInt32Type>();
-        let values = dict.values().as_string::<i32>();
-        let sentinel = self.sentinel();
-
-        let key_to_bin: Vec<u16> = values
-            .iter()
-            .map(|v| v.and_then(|s| self.categories_to_bins.get(s)).copied().unwrap_or(sentinel))
-            .collect();
-
-        Ok(dict.keys()
-            .iter()
-            .map(|k| k.map_or(sentinel, |k| key_to_bin[k as usize]))
-            .collect())
-    }
-}
 
 #[cfg(test)]
 mod tests {

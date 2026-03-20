@@ -2,7 +2,7 @@ use arrow::array::{Array, AsArray, Float64Array, RecordBatch};
 use arrow::datatypes::DataType;
 use arrow::error::ArrowError;
 
-use crate::bin::{Binner, BinMapper, CatMapper};
+use crate::bin::{BinMapper, CatMapper};
 
 /// Wraps either a numeric (`BinMapper`) or categorical (`CatMapper`) binner for a single feature.
 pub enum FeatureBinner {
@@ -10,15 +10,15 @@ pub enum FeatureBinner {
     Categorical(CatMapper),
 }
 
-impl Binner for FeatureBinner {
-    fn num_bins(&self) -> usize {
+impl FeatureBinner {
+    pub fn num_bins(&self) -> usize {
         match self {
             Self::Numeric(b) => b.num_bins(),
             Self::Categorical(b) => b.num_bins(),
         }
     }
 
-    fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u16>, ArrowError> {
+    pub fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u16>, ArrowError> {
         match self {
             Self::Numeric(b) => b.array_to_bins(array),
             Self::Categorical(b) => b.array_to_bins(array),

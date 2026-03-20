@@ -1,5 +1,6 @@
 //! Histogram-based gradient and hessian accumulation, and best-split finding.
 
+use crate::parameters::Parameters;
 use crate::utils::calculate_score;
 
 #[derive(Clone, Default, Debug)]
@@ -35,17 +36,6 @@ impl Scratch {
     }
 }
 
-
-pub struct Parameters {
-    pub lambda_l1: f64,
-    pub lambda_l2: f64,
-    pub min_data_in_leaf: usize,
-    pub min_sum_hessian_in_leaf: f64,
-    pub max_depth: usize,
-    pub njobs: usize,
-    pub num_iterations: usize,
-    pub learning_rate: f64,
-}
 
 #[derive(Clone, Debug)]
 pub enum Threshold {
@@ -250,11 +240,8 @@ impl Histogram {
             + if best_missing_goes_left { sentinel.sum_gradients } else { 0.0 };
         let left_hessian  = scratch.cumsum_hessians[best_threshold] 
             + if best_missing_goes_left { sentinel.sum_hessians } else { 0.0 };
-        let left_count    = scratch.cumsum_counts[best_threshold] 
-            + if best_missing_goes_left { sentinel.count } else { 0 };
         let right_gradient = total_gradient - left_gradient;
         let right_hessian  = total_hessian - left_hessian;
-        let right_count    = total_count - left_count;
 
         Some(SplitInfo {
             gain: best_score - parent_score,
@@ -384,13 +371,14 @@ impl Histogram {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameters::Parameters;
 
     fn assert_approx_eq(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-7, "{a} != {b}");
     }
 
-    fn default_parameters() -> Parameters {
-        Parameters { lambda_l1: 0.0, lambda_l2: 0.0, min_data_in_leaf: 1, min_sum_hessian_in_leaf: 0.0, max_depth: 6, njobs: 1, num_iterations: 100, learning_rate: 0.1 }
+    fn p() -> Parameters {
+        Parameters { min_data_in_leaf: 1, min_sum_hessian_in_leaf: 0.0, ..Parameters::default() }
     }
 
     #[test]
@@ -423,7 +411,7 @@ mod tests {
     fn test_find_best_numeric_split() {
         // Bins 0+1 (G=-20, H=20) vs bin 2 (G=20, H=10): gain = 400/20 + 400/10 = 60.
         // No missings: missing_goes_left = left_count(20) > right_count(10).
-        let parameters = default_parameters();
+        let parameters = p();
         let hist = Histogram { bins: vec![
             HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 },
             HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 },
@@ -445,14 +433,14 @@ mod tests {
         let grads = vec![1.0, 1.0, 1.0];
         let hess = vec![1.0; 3];
         let hist = Histogram::build(&feature_bins, &grads, &hess, &[0u32, 1, 2], 3);
-        assert!(hist.find_best_numeric_split(3.0, 3.0, 3, 3.0, &default_parameters(), &mut Scratch::new(3)).is_none());
+        assert!(hist.find_best_numeric_split(3.0, 3.0, 3, 3.0, &p(), &mut Scratch::new(3)).is_none());
     }
 
     #[test]
     fn test_numeric_split_with_missings() {
         // missing_goes_left: left G=-20,H=20 → 20; right G=20,H=10 → 40; gain=60.
         // missing_goes_right: left G=-10,H=10 → 10; right G=10,H=20 → 5; gain=15.
-        let parameters = default_parameters();
+        let parameters = p();
         let hist = Histogram { bins: vec![
             HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 },
             HistogramBin { sum_gradients:  20.0, sum_hessians: 10.0, count: 10 },
@@ -467,7 +455,7 @@ mod tests {
     fn test_find_best_categorical_split() {
         // Bins 0 and 2 share ratio -1, bin 1 has ratio +2.
         // Fisher sorting groups 0 and 2 into left prefix → gain = 400/20 + 400/10 = 60.
-        let parameters = default_parameters();
+        let parameters = p();
         let hist = Histogram { bins: vec![
             HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 },
             HistogramBin { sum_gradients:  20.0, sum_hessians: 10.0, count: 10 },
@@ -495,15 +483,14 @@ mod tests {
         let hess = vec![1.0; 10];
         let hist = Histogram::build(&feature_bins, &grads, &hess, &(0..10u32).collect::<Vec<_>>(), 1);
         let (g, h, c) = hist.bins.iter().fold((0.0, 0.0, 0u32), |(g, h, c), b| (g + b.sum_gradients, h + b.sum_hessians, c + b.count));
-        let split = hist.find_best_categorical_split(g, h, c, 0.0, &default_parameters(), &mut Scratch::new(1)).unwrap();
+        let split = hist.find_best_categorical_split(g, h, c, 0.0, &p(), &mut Scratch::new(1)).unwrap();
         assert!(split.missing_goes_left);
     }
 
     #[test]
     fn test_leaf_constraints() {
         // Mathematically a split exists, but both children would have only 10 rows < min_data_in_leaf=15.
-        let mut parameters = default_parameters();
-        parameters.min_data_in_leaf = 15;
+        let parameters = Parameters { min_data_in_leaf: 15, ..p() };
         let hist = Histogram { bins: vec![
             HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 },
             HistogramBin { sum_gradients:  10.0, sum_hessians: 10.0, count: 10 },
