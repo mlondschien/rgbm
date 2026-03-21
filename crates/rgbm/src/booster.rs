@@ -99,7 +99,7 @@ mod tests {
     use arrow::array::Float64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use crate::dataset::Dataset;
-    use crate::objective::{BinaryLogloss, SquaredLoss};
+    use crate::objective::{BinaryLogloss, Probit, SquaredLoss};
     use crate::parameters::Parameters;
 
     fn make_dataset(x: Vec<f64>, y: Vec<f64>) -> (Dataset, RecordBatch) {
@@ -140,6 +140,23 @@ mod tests {
         booster.fit(&dataset);
         let preds = booster.predict(&batch);
         assert!(mse(&preds, &y) < variance * 0.01);
+    }
+
+    #[test]
+    fn test_fit_probit() {
+        let n = 200;
+        let x: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
+        let y: Vec<f64> = x.iter().map(|&xi| if xi > 0.5 { 1.0 } else { 0.0 }).collect();
+        let (dataset, batch) = make_dataset(x, y.clone());
+
+        let mut booster = Booster::new(test_params(), Box::new(Probit));
+        booster.fit(&dataset);
+        let preds = booster.predict(&batch);
+
+        let correct = preds.values().iter().zip(&y)
+            .filter(|&(&p, &yi)| (p > 0.5) == (yi > 0.5))
+            .count();
+        assert!(correct as f64 / n as f64 > 0.95);
     }
 
     #[test]
