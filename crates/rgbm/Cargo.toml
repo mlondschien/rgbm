@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 arrow = { workspace = true }
-rayon = { workspace = true }
 rand = { workspace = true }
 ahash = { workspace = true }
 libm = { workspace = true }

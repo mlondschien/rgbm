@@ -1,7 +1,5 @@
 #[derive(Clone, Debug)]
 pub struct Parameters {
-    // Booster level
-    pub njobs: usize,
     pub num_iterations: usize,
     pub learning_rate: f64,
 
@@ -22,7 +20,6 @@ pub struct Parameters {
 impl Default for Parameters {
     fn default() -> Self {
         Self {
-            njobs: 1,
             num_iterations: 100,
             learning_rate: 0.1,
             max_bin: 255,

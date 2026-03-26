@@ -1,5 +1,3 @@
-use rayon::prelude::*;
-
 use arrow::array::{Array, PrimitiveArray};
 use arrow::datatypes::{Float64Type, UInt32Type};
 
@@ -73,14 +71,12 @@ impl Tree {
 pub struct TreeBuilder<'a> {
     pub parameters: &'a Parameters,
     pub nodes: Vec<TreeNode>,
-    pool: &'a rayon::ThreadPool,
 }
 
 impl<'a> TreeBuilder<'a> {
-    pub fn new(parameters: &'a Parameters, pool: &'a rayon::ThreadPool) -> Self {
+    pub fn new(parameters: &'a Parameters) -> Self {
         Self {
             parameters,
-            pool,
             nodes: Vec::with_capacity((1 << (parameters.max_depth + 1)) - 1),
         }
     }
@@ -94,15 +90,11 @@ impl<'a> TreeBuilder<'a> {
         let total_hessian: f64 = hessians.iter().sum();
         let total_score = calculate_score(total_gradient, total_hessian, self.parameters.lambda_l1, self.parameters.lambda_l2);
 
-        let pool = self.pool;
-        let histograms: Vec<Histogram> = pool.install(|| {
-            (0..dataset.num_features)
-                .into_par_iter()
-                .map(|f| Histogram::build(&dataset.binned_features[f], gradients, hessians, &indices, dataset.feature_binners[f].num_bins()))
-                .collect()
-        });
+        let histograms: Vec<Histogram> = (0..dataset.num_features)
+            .map(|f| Histogram::build(&dataset.binned_features[f], gradients, hessians, &indices, dataset.feature_binners[f].num_bins()))
+            .collect();
 
-        self.build_node(pool, dataset, &mut indices, gradients, hessians, total_gradient, total_hessian, total_score, histograms, 0, &mut leaf_indices);
+        self.build_node(dataset, &mut indices, gradients, hessians, total_gradient, total_hessian, total_score, histograms, 0, &mut leaf_indices);
 
         (Tree { nodes: self.nodes.clone() }, leaf_indices)
     }
@@ -110,7 +102,6 @@ impl<'a> TreeBuilder<'a> {
     #[allow(clippy::too_many_arguments)]
     fn build_node(
         &mut self,
-        pool: &rayon::ThreadPool,
         dataset: &Dataset,
         indices: &mut [u32],
         gradients: &[f64],
@@ -131,26 +122,20 @@ impl<'a> TreeBuilder<'a> {
             return leaf_idx;
         }
 
-        let best_split = pool.install(|| {
-            (0..dataset.num_features)
-                .into_par_iter()
-                .map_init(
-                    || Scratch::new(dataset.max_bins),
-                    |scratch, f| {
-                        let split = match &dataset.feature_binners[f] {
-                            FeatureBinner::Numeric(_) => histograms[f].find_best_numeric_split(
-                                total_gradient, total_hessian, indices.len() as u32, total_score, p, scratch,
-                            ),
-                            FeatureBinner::Categorical(_) => histograms[f].find_best_categorical_split(
-                                total_gradient, total_hessian, indices.len() as u32, total_score, p, scratch,
-                            ),
-                        };
-                        split.map(|s| (f, s))
-                    },
-                )
-                .filter_map(|x| x)
-                .max_by(|a, b| a.1.gain.partial_cmp(&b.1.gain).unwrap())
-        });
+        let mut scratch = Scratch::new(dataset.max_bins);
+        let best_split = (0..dataset.num_features)
+            .filter_map(|f| {
+                let split = match &dataset.feature_binners[f] {
+                    FeatureBinner::Numeric(_) => histograms[f].find_best_numeric_split(
+                        total_gradient, total_hessian, indices.len() as u32, total_score, p, &mut scratch,
+                    ),
+                    FeatureBinner::Categorical(_) => histograms[f].find_best_categorical_split(
+                        total_gradient, total_hessian, indices.len() as u32, total_score, p, &mut scratch,
+                    ),
+                };
+                split.map(|s| (f, s))
+            })
+            .max_by(|a, b| a.1.gain.partial_cmp(&b.1.gain).unwrap());
 
         let (best_f, split) = match best_split {
             Some(res) => res,
@@ -168,19 +153,14 @@ impl<'a> TreeBuilder<'a> {
         // by subtracting the smaller from the parent.
         let left_is_smaller = left_indices.len() < right_indices.len();
         let smaller_idx: &[u32] = if left_is_smaller { left_indices } else { right_indices };
-        let (left_hists, right_hists): (Vec<Histogram>, Vec<Histogram>) = {
-            pool.install(|| {
-                (0..dataset.num_features)
-                    .into_par_iter()
-                    .map(|f| {
-                        let small_hist = Histogram::build(&dataset.binned_features[f], gradients, hessians, smaller_idx, dataset.feature_binners[f].num_bins());
-                        let mut large_hist = Histogram { bins: vec![HistogramBin::default(); small_hist.bins.len()] };
-                        large_hist.subtract(&histograms[f], &small_hist);
-                        if left_is_smaller { (small_hist, large_hist) } else { (large_hist, small_hist) }
-                    })
-                    .unzip()
+        let (left_hists, right_hists): (Vec<Histogram>, Vec<Histogram>) = (0..dataset.num_features)
+            .map(|f| {
+                let small_hist = Histogram::build(&dataset.binned_features[f], gradients, hessians, smaller_idx, dataset.feature_binners[f].num_bins());
+                let mut large_hist = Histogram { bins: vec![HistogramBin::default(); small_hist.bins.len()] };
+                large_hist.subtract(&histograms[f], &small_hist);
+                if left_is_smaller { (small_hist, large_hist) } else { (large_hist, small_hist) }
             })
-        };
+            .unzip();
 
         // reserve a slot for the node
         let my_idx = self.nodes.len();
@@ -189,8 +169,8 @@ impl<'a> TreeBuilder<'a> {
             threshold: FinalThreshold::Numeric(0.0), missing_goes_left: false, value: 0.0,
         });
 
-        let left_child = self.build_node(pool, dataset, left_indices, gradients, hessians, split.left_gradient, split.left_hessian, split.left_score, left_hists, depth + 1, leaf_indices);
-        let right_child = self.build_node(pool, dataset, right_indices, gradients, hessians, split.right_gradient, split.right_hessian, split.right_score, right_hists, depth + 1, leaf_indices);
+        let left_child = self.build_node(dataset, left_indices, gradients, hessians, split.left_gradient, split.left_hessian, split.left_score, left_hists, depth + 1, leaf_indices);
+        let right_child = self.build_node(dataset, right_indices, gradients, hessians, split.right_gradient, split.right_hessian, split.right_score, right_hists, depth + 1, leaf_indices);
 
         let threshold = match &split.threshold {
             Threshold::Numeric(bin) => {

@@ -1,5 +1,3 @@
-use rayon::prelude::*;
-
 use arrow::array::{DictionaryArray, Float64Array, PrimitiveArray};
 use arrow::datatypes::{Float64Type, UInt32Type};
 use arrow::record_batch::RecordBatch;
@@ -14,22 +12,15 @@ pub struct Booster {
     pub objective: Box<dyn Objective>,
     pub trees: Vec<Tree>,
     pub base_score: f64,
-    pub pool: rayon::ThreadPool,
 }
 
 impl Booster {
     pub fn new(parameters: Parameters, objective: Box<dyn Objective>) -> Self {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(parameters.njobs)
-            .build()
-            .expect("failed to build thread pool");
-
         Self {
             parameters,
             objective,
             trees: Vec::new(),
             base_score: 0.0,
-            pool,
         }
     }
 
@@ -42,21 +33,13 @@ impl Booster {
         let mut hessians = vec![0.0; dataset.num_rows];
 
         self.trees.clear();
-        let mut builder = TreeBuilder::new(&self.parameters, &self.pool);
+        let mut builder = TreeBuilder::new(&self.parameters);
 
-        // compute gradients / hessians in parallel. Overkill for MSE or binary
-        // log-loss, but maybe worth it for more complex objectives (probit?).
         for _ in 0..self.parameters.num_iterations {
-            self.pool.install(|| {
-                gradients.par_iter_mut()
-                    .zip(hessians.par_iter_mut())
-                    .zip(labels.par_iter())
-                    .zip(scores.par_iter())
-                    .for_each(|(((g, h), &label), &score)| {
-                        *g = self.objective.gradient(label, score);
-                        *h = self.objective.hessian(label, score);
-                    });
-            });
+            for (((g, h), &label), &score) in gradients.iter_mut().zip(hessians.iter_mut()).zip(labels.iter()).zip(scores.iter()) {
+                *g = self.objective.gradient(label, score);
+                *h = self.objective.hessian(label, score);
+            }
 
             let (tree, leaf_indices) = builder.fit(dataset, &gradients, &hessians);
 
