@@ -222,7 +222,7 @@ impl<'a> TreeBuilder<'a> {
 
     fn partition_indices(&self, dataset: &Dataset, indices: &mut [u32], feature: usize, split: &SplitInfo) -> usize {
         let feature_col = &dataset.binned_features[feature];
-        let sentinel = dataset.feature_binners[feature].num_bins() as u16;
+        let sentinel = dataset.feature_binners[feature].num_bins() as u8;
 
         let goes_left = |row: u32| {
             let bin = feature_col[row as usize];
@@ -230,7 +230,7 @@ impl<'a> TreeBuilder<'a> {
                 split.missing_goes_left
             } else {
                 match &split.threshold {
-                    Threshold::Numeric(t) => bin <= *t as u16,
+                    Threshold::Numeric(t) => bin <= *t as u8,
                     Threshold::Categorical(goes_left) => goes_left[bin as usize],
                 }
             }

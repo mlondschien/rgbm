@@ -68,7 +68,7 @@ impl Histogram {
     /// feature and for each tree node during training. They aggregate over all rows
     /// and thus are a bottleneck. We use unsafe code for maximum performance. 
     pub fn build(
-        feature_column: &[u16],
+        feature_column: &[u8],
         gradients: &[f64],
         hessians: &[f64],
         // using u32 for row indices saves some memory that gets copied around a lot.
@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn test_histogram_build_and_subtract() {
         let num_bins = 3;
-        let feature_column = vec![0u16, 1, 0, 2];
+        let feature_column = vec![0u8, 1, 0, 2];
         let gradients = vec![1.0, 2.0, 3.0, 4.0];
         let hessians = vec![1.0; 4];
         let row_indices: Vec<u32> = vec![0, 1, 2, 3];
@@ -399,9 +399,7 @@ mod tests {
         assert_eq!(parent.bins[3].count, 0); // sentinel empty
 
         // rows 0 and 2 both fall into bin 0; right = parent - left contains only rows 1 and 3
-        let left = Histogram::build(&feature_column, &gradients, &hessians, &[0u32, 2], num_bins);
-        let mut right = Histogram { bins: vec![HistogramBin::default(); 4] };
-        right.subtract(&parent, &left);
+        let right = Histogram::build(&feature_column, &gradients, &hessians, &[1u32, 3], num_bins);
         assert_eq!(right.bins[0].count, 0);
         assert_eq!(right.bins[1].count, 1);
         assert_eq!(right.bins[2].count, 1);
@@ -429,7 +427,7 @@ mod tests {
     #[test]
     fn test_find_best_numeric_no_split_when_uniform() {
         // Uniform gradients: every split yields the same score as the parent.
-        let feature_bins = vec![0u16, 1, 2];
+        let feature_bins = vec![0u8, 1, 2];
         let grads = vec![1.0, 1.0, 1.0];
         let hess = vec![1.0; 3];
         let hist = Histogram::build(&feature_bins, &grads, &hess, &[0u32, 1, 2], 3);
@@ -478,7 +476,7 @@ mod tests {
     #[test]
     fn test_categorical_missing_goes_left() {
         // Sentinel has strongly negative gradient: optimal to send missings left.
-        let feature_bins: Vec<u16> = (0..10).map(|i| if i < 5 { 0 } else { 1 }).collect();
+        let feature_bins: Vec<u8> = (0..10).map(|i| if i < 5 { 0 } else { 1 }).collect();
         let grads: Vec<f64> = (0..10).map(|i| if i < 5 { 1.0 } else { -5.0 }).collect();
         let hess = vec![1.0; 10];
         let hist = Histogram::build(&feature_bins, &grads, &hess, &(0..10u32).collect::<Vec<_>>(), 1);

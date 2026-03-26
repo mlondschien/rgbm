@@ -22,8 +22,8 @@ impl BinMapper {
         self.upper_bounds.len()
     }
 
-    pub fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u16>, ArrowError> {
-        let sentinel = self.num_bins() as u16;
+    pub fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u8>, ArrowError> {
+        let sentinel = self.num_bins() as u8;
         let values = array.as_primitive_opt::<Float64Type>()
             .ok_or(ArrowError::CastError("expected Float64Array".into()))?;
         Ok(values.iter().map(|v| match v {
@@ -59,8 +59,8 @@ impl BinMapper {
     }
 
     /// Map a single value to its bin index via binary search.
-    pub fn value_to_bin(&self, value: f64) -> u16 {
-        self.upper_bounds.partition_point(|&bound| bound < value) as u16
+    pub fn value_to_bin(&self, value: f64) -> u8 {
+        self.upper_bounds.partition_point(|&bound| bound < value) as u8
     }
 
     /// Greedy bin boundary search over sorted values.
@@ -127,7 +127,7 @@ impl BinMapper {
 /// tree follows a predetermined direction at each split.
 pub struct CatMapper {
     /// Maps each category string to its bin index (its position in the training dictionary).
-    pub categories_to_bins: AHashMap<String, u16>,
+    pub categories_to_bins: AHashMap<String, u8>,
 }
 
 impl CatMapper {
@@ -135,15 +135,15 @@ impl CatMapper {
         self.categories_to_bins.len()
     }
 
-    pub fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u16>, ArrowError> {
-        let sentinel = self.num_bins() as u16;
+    pub fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u8>, ArrowError> {
+        let sentinel = self.num_bins() as u8;
         let casted = cast(
             array,
             &DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
         )?;
         let dict = casted.as_dictionary::<UInt32Type>();
         let values = dict.values().as_string::<i32>();
-        let key_to_bin: Vec<u16> = values
+        let key_to_bin: Vec<u8> = values
             .iter()
             .map(|v| v.and_then(|s| self.categories_to_bins.get(s)).copied().unwrap_or(sentinel))
             .collect();
@@ -162,7 +162,7 @@ impl CatMapper {
         let mut categories_to_bins = AHashMap::new();
         for i in 0..values.len() {
             if values.is_valid(i) {
-                categories_to_bins.insert(values.value(i).to_string(), i as u16);
+                categories_to_bins.insert(values.value(i).to_string(), i as u8);
             }
         }
         
@@ -171,10 +171,10 @@ impl CatMapper {
 
     /// Map a single category string to its bin index.
     /// Unknown categories (unseen during training) map to the sentinel index `num_bins()`.
-    pub fn value_to_bin(&self, value: &str) -> u16 {
+    pub fn value_to_bin(&self, value: &str) -> u8 {
         *self.categories_to_bins
             .get(value)
-            .unwrap_or(&(self.num_bins() as u16))
+            .unwrap_or(&(self.num_bins() as u8))
     }
 }
 
@@ -219,8 +219,8 @@ mod tests {
         let arr = Float64Array::from(vec![Some(1.0), None, Some(f64::NAN)]);
         let mapper = BinMapper::from_array(&arr, 255, 1);
         let bins = mapper.array_to_bins(&arr).unwrap();
-        assert_eq!(bins[1], mapper.num_bins() as u16);
-        assert_eq!(bins[2], mapper.num_bins() as u16);
+        assert_eq!(bins[1], mapper.num_bins() as u8);
+        assert_eq!(bins[2], mapper.num_bins() as u8);
     }
 
     #[test]
