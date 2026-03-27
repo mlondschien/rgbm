@@ -5,7 +5,7 @@ use arrow::record_batch::RecordBatch;
 use crate::dataset::Dataset;
 use crate::parameters::Parameters;
 use crate::objective::Objective;
-use crate::tree::{Tree, TreeBuilder};
+use crate::tree::Tree;
 
 pub struct Booster {
     pub parameters: Parameters,
@@ -33,7 +33,6 @@ impl Booster {
         let mut hessians = vec![0.0; dataset.num_rows];
 
         self.trees.clear();
-        let mut builder = TreeBuilder::new(&self.parameters);
 
         for _ in 0..self.parameters.num_iterations {
             for (((g, h), &label), &score) in gradients.iter_mut().zip(hessians.iter_mut()).zip(labels.iter()).zip(scores.iter()) {
@@ -41,7 +40,8 @@ impl Booster {
                 *h = self.objective.hessian(label, score);
             }
 
-            let (tree, leaf_indices) = builder.fit(dataset, &gradients, &hessians);
+            let mut tree = Tree::new(self.parameters.max_leaves);
+            let leaf_indices = tree.fit(dataset, &gradients, &hessians, &self.parameters);
 
             for (score, &leaf_idx) in scores.iter_mut().zip(&leaf_indices) {
                 *score += tree.nodes[leaf_idx as usize].value;

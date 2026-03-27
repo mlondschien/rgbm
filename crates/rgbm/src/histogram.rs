@@ -3,37 +3,12 @@
 use crate::parameters::Parameters;
 use crate::utils::calculate_score;
 
+
 #[derive(Clone, Default, Debug)]
 pub struct HistogramBin {
     pub sum_gradients: f64,
     pub sum_hessians: f64,
     pub count: u32,
-}
-
-pub struct Scratch {  // reuse memory in split finding
-    cumsum_gradients: Vec<f64>,
-    cumsum_hessians: Vec<f64>,
-    cumsum_counts: Vec<u32>,
-    // (gradient ratio, bin index) pairs for categorical splits
-    categorical_order: Vec<(f64, usize)>,
-}
-
-impl Scratch {
-    pub fn new(num_bins: usize) -> Self {
-        Self {
-            cumsum_gradients: Vec::with_capacity(num_bins),
-            cumsum_hessians: Vec::with_capacity(num_bins),
-            cumsum_counts: Vec::with_capacity(num_bins),
-            categorical_order: Vec::with_capacity(num_bins),
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.cumsum_gradients.clear();
-        self.cumsum_hessians.clear();
-        self.cumsum_counts.clear();
-        self.categorical_order.clear();
-    }
 }
 
 
@@ -119,7 +94,6 @@ impl Histogram {
         total_count: u32,
         parent_score: f64,
         parameters: &Parameters,
-        scratch: &mut Scratch,
     ) -> Option<SplitInfo> {
         let num_bins = self.bins.len().saturating_sub(1);
         if num_bins == 0 { return None; }
@@ -130,13 +104,9 @@ impl Histogram {
         let mut left_hessian = 0.0;
         let mut left_count = 0u32;
 
-        scratch.clear();
-
-        // Let's hope the reserve call helps the compiler remove bounds checks in the 
-        // loop below.
-        scratch.cumsum_counts.reserve(num_bins);
-        scratch.cumsum_gradients.reserve(num_bins);
-        scratch.cumsum_hessians.reserve(num_bins);
+        let mut cumsum_gradients = Vec::with_capacity(num_bins);
+        let mut cumsum_hessians = Vec::with_capacity(num_bins);
+        let mut cumsum_counts = Vec::with_capacity(num_bins);
 
         // Pass 1 through the data: Compute cumulative sums.
         for bin in &self.bins[..num_bins] {
@@ -144,9 +114,9 @@ impl Histogram {
             left_hessian += bin.sum_hessians;
             left_count += bin.count;
 
-            scratch.cumsum_gradients.push(left_gradient);
-            scratch.cumsum_hessians.push(left_hessian);
-            scratch.cumsum_counts.push(left_count);
+            cumsum_gradients.push(left_gradient);
+            cumsum_hessians.push(left_hessian);
+            cumsum_counts.push(left_count);
         }
 
         let mut best_score = f64::NEG_INFINITY;
@@ -159,9 +129,9 @@ impl Histogram {
             // Pass 2: SIMD-friendly gain calculation. The goal is to have no loop-
             // carried dependencies so the compiler can perfectly unroll and vectorize.
             for t in 0..num_bins {
-                let left_gradient = scratch.cumsum_gradients[t];
-                let left_hessian = scratch.cumsum_hessians[t];
-                let left_count = scratch.cumsum_counts[t];
+                let left_gradient = cumsum_gradients[t];
+                let left_hessian = cumsum_hessians[t];
+                let left_count = cumsum_counts[t];
 
                 let right_count = total_count - left_count;
                 let right_hessian = total_hessian - left_hessian;
@@ -193,9 +163,9 @@ impl Histogram {
             for t in 0..num_bins {
                 // Same code as above. First compute score for missing_goes_left = false.
                 // Note that total_count includes the missing values bin.
-                let left_gradient = scratch.cumsum_gradients[t];
-                let left_hessian = scratch.cumsum_hessians[t];
-                let left_count = scratch.cumsum_counts[t];
+                let left_gradient = cumsum_gradients[t];
+                let left_hessian = cumsum_hessians[t];
+                let left_count = cumsum_counts[t];
 
                 let right_count = total_count - left_count;
                 let right_hessian = total_hessian - left_hessian;
@@ -236,9 +206,9 @@ impl Histogram {
         // Only ever split with positive gain.
         if best_score <= parent_score { return None; }
 
-        let left_gradient = scratch.cumsum_gradients[best_threshold] 
+        let left_gradient = cumsum_gradients[best_threshold]
             + if best_missing_goes_left { sentinel.sum_gradients } else { 0.0 };
-        let left_hessian  = scratch.cumsum_hessians[best_threshold] 
+        let left_hessian  = cumsum_hessians[best_threshold]
             + if best_missing_goes_left { sentinel.sum_hessians } else { 0.0 };
         let right_gradient = total_gradient - left_gradient;
         let right_hessian  = total_hessian - left_hessian;
@@ -264,62 +234,60 @@ impl Histogram {
         total_count: u32,
         parent_score: f64,
         parameters: &Parameters,
-        scratch: &mut Scratch,
     ) -> Option<SplitInfo> {
         let num_bins = self.bins.len().saturating_sub(1);
         if num_bins == 0 { return None; }
 
-        scratch.clear();
-        
         // Instead of checking all 2^num_bins subsets, we first sort categories by their
         // gradient/hessian ratio. Then we only need to check splits between sorted
         // categories. This is exact according to Fisher, W. D. (1958).
 
         // PASS 1: Filter active bins AND the sentinel bin (index == num_bins).
         // By using `0..=num_bins`, we treat missing values as just another category.
+        let mut categorical_order: Vec<(f64, usize)> = Vec::with_capacity(num_bins + 1);
         for k in 0..=num_bins {
             let bin = &self.bins[k];
             if bin.count > 0 {
                 let ratio = bin.sum_gradients / (bin.sum_hessians + parameters.lambda_l2);
-                scratch.categorical_order.push((ratio, k));
+                categorical_order.push((ratio, k));
             }
         }
 
-        if scratch.categorical_order.is_empty() { return None; }
+        if categorical_order.is_empty() { return None; }
 
         // Sort categories to find the optimal contiguous binary partition
-        scratch.categorical_order.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        categorical_order.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-        let num_active_bins = scratch.categorical_order.len();
+        let num_active_bins = categorical_order.len();
 
-        scratch.cumsum_counts.reserve(num_active_bins);
-        scratch.cumsum_gradients.reserve(num_active_bins);
-        scratch.cumsum_hessians.reserve(num_active_bins);
+        let mut cumsum_gradients = Vec::with_capacity(num_active_bins);
+        let mut cumsum_hessians = Vec::with_capacity(num_active_bins);
+        let mut cumsum_counts = Vec::with_capacity(num_active_bins);
 
         let mut left_gradient = 0.0;
         let mut left_hessian = 0.0;
         let mut left_count = 0u32;
 
         // PASS 2: Compute cumsums over the SORTED categorical order
-        for &(_, k) in &scratch.categorical_order {
+        for &(_, k) in &categorical_order {
             let bin = &self.bins[k];
             left_gradient += bin.sum_gradients;
             left_hessian += bin.sum_hessians;
             left_count += bin.count;
 
-            scratch.cumsum_gradients.push(left_gradient);
-            scratch.cumsum_hessians.push(left_hessian);
-            scratch.cumsum_counts.push(left_count);
+            cumsum_gradients.push(left_gradient);
+            cumsum_hessians.push(left_hessian);
+            cumsum_counts.push(left_count);
         }
 
         let mut best_score = f64::NEG_INFINITY;
         let mut best_threshold = 0usize;
 
-        // PASS 3: SIMD-friendly gain calculation. 
+        // PASS 3: SIMD-friendly gain calculation.
         for t in 0..num_active_bins {
-            let left_gradient = scratch.cumsum_gradients[t];
-            let left_hessian = scratch.cumsum_hessians[t];
-            let left_count = scratch.cumsum_counts[t];
+            let left_gradient = cumsum_gradients[t];
+            let left_hessian = cumsum_hessians[t];
+            let left_count = cumsum_counts[t];
 
             let right_count = total_count - left_count;
             let right_hessian = total_hessian - left_hessian;
@@ -340,7 +308,7 @@ impl Histogram {
         let mut goes_left = vec![false; num_bins];
         let mut missing_goes_left = false;
 
-        for &(_, k) in &scratch.categorical_order[..best_threshold + 1] {
+        for &(_, k) in &categorical_order[..best_threshold + 1] {
             if k == num_bins {
                 missing_goes_left = true;
             } else {
@@ -348,8 +316,8 @@ impl Histogram {
             }
         }
 
-        let left_gradient = scratch.cumsum_gradients[best_threshold];
-        let left_hessian = scratch.cumsum_hessians[best_threshold];
+        let left_gradient = cumsum_gradients[best_threshold];
+        let left_hessian = cumsum_hessians[best_threshold];
         let right_gradient = total_gradient - left_gradient;
         let right_hessian = total_hessian - left_hessian;
 
@@ -416,7 +384,7 @@ mod tests {
             HistogramBin { sum_gradients:  20.0, sum_hessians: 10.0, count: 10 },
             HistogramBin { sum_gradients:   0.0, sum_hessians:  0.0, count:  0 },
         ]};
-        let split = hist.find_best_numeric_split(0.0, 30.0, 30, 0.0, &parameters, &mut Scratch::new(3)).unwrap();
+        let split = hist.find_best_numeric_split(0.0, 30.0, 30, 0.0, &parameters).unwrap();
         assert!(matches!(split.threshold, Threshold::Numeric(1)));
         assert_approx_eq(split.gain, 60.0);
         assert_approx_eq(split.left_score, 20.0);
@@ -431,7 +399,7 @@ mod tests {
         let grads = vec![1.0, 1.0, 1.0];
         let hess = vec![1.0; 3];
         let hist = Histogram::build(&feature_bins, &grads, &hess, &[0u32, 1, 2], 3);
-        assert!(hist.find_best_numeric_split(3.0, 3.0, 3, 3.0, &p(), &mut Scratch::new(3)).is_none());
+        assert!(hist.find_best_numeric_split(3.0, 3.0, 3, 3.0, &p()).is_none());
     }
 
     #[test]
@@ -444,7 +412,7 @@ mod tests {
             HistogramBin { sum_gradients:  20.0, sum_hessians: 10.0, count: 10 },
             HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 }, // sentinel
         ]};
-        let split = hist.find_best_numeric_split(0.0, 30.0, 30, 0.0, &parameters, &mut Scratch::new(2)).unwrap();
+        let split = hist.find_best_numeric_split(0.0, 30.0, 30, 0.0, &parameters).unwrap();
         assert_approx_eq(split.gain, 60.0);
         assert!(split.missing_goes_left);
     }
@@ -460,7 +428,7 @@ mod tests {
             HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 },
             HistogramBin { sum_gradients:   0.0, sum_hessians:  0.0, count:  0 },
         ]};
-        let split = hist.find_best_categorical_split(0.0, 30.0, 30, 0.0, &parameters, &mut Scratch::new(3)).unwrap();
+        let split = hist.find_best_categorical_split(0.0, 30.0, 30, 0.0, &parameters).unwrap();
         assert_approx_eq(split.gain, 60.0);
         match &split.threshold {
             Threshold::Categorical(goes_left) => {
@@ -481,7 +449,7 @@ mod tests {
         let hess = vec![1.0; 10];
         let hist = Histogram::build(&feature_bins, &grads, &hess, &(0..10u32).collect::<Vec<_>>(), 1);
         let (g, h, c) = hist.bins.iter().fold((0.0, 0.0, 0u32), |(g, h, c), b| (g + b.sum_gradients, h + b.sum_hessians, c + b.count));
-        let split = hist.find_best_categorical_split(g, h, c, 0.0, &p(), &mut Scratch::new(1)).unwrap();
+        let split = hist.find_best_categorical_split(g, h, c, 0.0, &p()).unwrap();
         assert!(split.missing_goes_left);
     }
 
@@ -494,6 +462,6 @@ mod tests {
             HistogramBin { sum_gradients:  10.0, sum_hessians: 10.0, count: 10 },
             HistogramBin { sum_gradients:   0.0, sum_hessians:  0.0, count:  0 },
         ]};
-        assert!(hist.find_best_numeric_split(0.0, 20.0, 20, 0.0, &parameters, &mut Scratch::new(2)).is_none());
+        assert!(hist.find_best_numeric_split(0.0, 20.0, 20, 0.0, &parameters).is_none());
     }
 }

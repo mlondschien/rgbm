@@ -56,7 +56,7 @@ impl GradientBooster {
 
         Ok(Self {
             booster: Booster::new(Parameters {
-                njobs: 1, num_iterations, learning_rate, max_depth,
+                num_iterations, learning_rate, max_depth,
                 min_data_in_leaf, min_sum_hessian_in_leaf,
                 lambda_l1, lambda_l2, max_bin, min_data_in_bin, max_leaves, leaf_wise,
             }, obj),
