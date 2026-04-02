@@ -1,7 +1,8 @@
 use arrow::array::{Array, PrimitiveArray};
 use arrow::datatypes::{Float64Type, UInt32Type};
 
-use crate::dataset::{Dataset, FeatureBinner};
+use crate::bin::{BinnerKind, FeatureBinner};
+use crate::dataset::Dataset;
 use crate::histogram::{Histogram, HistogramBin, SplitInfo, Threshold};
 use crate::parameters::Parameters;
 use crate::utils::{calculate_score, calculate_weight};
@@ -54,11 +55,8 @@ fn find_best_split(
     }
     (0..feature_binners.len())
         .filter_map(|f| {
-            let split = match &feature_binners[f] {
-                FeatureBinner::Numeric(_) => histograms[f].find_best_numeric_split(total_gradient, total_hessian, n, parent_score, p),
-                FeatureBinner::Categorical(_) => histograms[f].find_best_categorical_split(total_gradient, total_hessian, n, parent_score, p),
-            };
-            split.map(|s| (f, s))
+            feature_binners[f].find_best_split(&histograms[f], total_gradient, total_hessian, n, parent_score, p)
+                .map(|s| (f, s))
         })
         .max_by(|a, b| a.1.gain.partial_cmp(&b.1.gain).unwrap())
 }
@@ -85,7 +83,7 @@ impl Tree {
         let total_score = calculate_score(total_gradient, total_hessian, p.lambda_l1, p.lambda_l2);
 
         let histograms: Vec<Histogram> = (0..dataset.num_features)
-            .map(|f| Histogram::build(&dataset.binned_features[f], gradients, hessians, &all_indices, dataset.feature_binners[f].num_bins()))
+            .map(|f| Histogram::build(&dataset.feature_binners[f].bins, gradients, hessians, &all_indices, dataset.feature_binners[f].num_bins()))
             .collect();
 
         let best_split = find_best_split(&dataset.feature_binners, p, &histograms, total_gradient, total_hessian, dataset.num_rows as u32, total_score, 0);
@@ -123,7 +121,7 @@ impl Tree {
             let right_histograms: Vec<Histogram>;
             if left_len < right_len {
                 left_histograms = (0..dataset.num_features)
-                    .map(|f| Histogram::build(&dataset.binned_features[f], gradients, hessians, &all_indices[left_start..left_start + left_len], dataset.feature_binners[f].num_bins()))
+                    .map(|f| Histogram::build(&dataset.feature_binners[f].bins, gradients, hessians, &all_indices[left_start..left_start + left_len], dataset.feature_binners[f].num_bins()))
                     .collect();
                 right_histograms = (0..dataset.num_features).map(|f| {
                     let mut h = Histogram { bins: vec![HistogramBin::default(); left_histograms[f].bins.len()] };
@@ -132,7 +130,7 @@ impl Tree {
                 }).collect();
             } else {
                 right_histograms = (0..dataset.num_features)
-                    .map(|f| Histogram::build(&dataset.binned_features[f], gradients, hessians, &all_indices[right_start..right_start + right_len], dataset.feature_binners[f].num_bins()))
+                    .map(|f| Histogram::build(&dataset.feature_binners[f].bins, gradients, hessians, &all_indices[right_start..right_start + right_len], dataset.feature_binners[f].num_bins()))
                     .collect();
                 left_histograms = (0..dataset.num_features).map(|f| {
                     let mut h = Histogram { bins: vec![HistogramBin::default(); right_histograms[f].bins.len()] };
@@ -148,9 +146,9 @@ impl Tree {
             let right_node = self.add_node(calculate_weight(split.right_gradient, split.right_hessian, p.lambda_l1, p.lambda_l2), p, right_start, right_len, right_histograms, right_best_split, depth + 1);
 
             let threshold = match &split.threshold {
-                Threshold::Numeric(bin) => FinalThreshold::Numeric(match &dataset.feature_binners[best_f] {
-                    FeatureBinner::Numeric(b) => b.upper_bounds[*bin as usize],
-                    FeatureBinner::Categorical(_) => panic!("numeric split on categorical feature"),
+                Threshold::Numeric(bin) => FinalThreshold::Numeric(match &dataset.feature_binners[best_f].kind {
+                    BinnerKind::Numerical(upper_bounds) => upper_bounds[*bin as usize],
+                    BinnerKind::Categorical(_) => panic!("numeric split on categorical feature"),
                 }),
                 Threshold::Categorical(gl) => FinalThreshold::Categorical(gl.clone()),
             };
@@ -228,7 +226,7 @@ impl Tree {
     }
 
     fn partition_indices(&self, dataset: &Dataset, indices: &mut [u32], feature: usize, split: &SplitInfo, left_buffer: &mut [u32], right_buffer: &mut [u32]) -> usize {
-        let col = &dataset.binned_features[feature];
+        let col = &dataset.feature_binners[feature].bins;
         let sentinel = dataset.feature_binners[feature].num_bins() as u8;
         let missing = split.missing_goes_left as usize;
         let mut left_count = 0usize;

@@ -1,35 +1,9 @@
-use arrow::array::{Array, AsArray, Float64Array, RecordBatch};
-use arrow::datatypes::DataType;
-use arrow::error::ArrowError;
+use arrow::array::{Float64Array, RecordBatch};
 
-use crate::bin::{BinMapper, CatMapper};
-
-/// Wraps either a numeric (`BinMapper`) or categorical (`CatMapper`) binner for a single feature.
-pub enum FeatureBinner {
-    Numeric(BinMapper),
-    Categorical(CatMapper),
-}
-
-impl FeatureBinner {
-    pub fn num_bins(&self) -> usize {
-        match self {
-            Self::Numeric(b) => b.num_bins(),
-            Self::Categorical(b) => b.num_bins(),
-        }
-    }
-
-    pub fn array_to_bins(&self, array: &dyn Array) -> Result<Vec<u8>, ArrowError> {
-        match self {
-            Self::Numeric(b) => b.array_to_bins(array),
-            Self::Categorical(b) => b.array_to_bins(array),
-        }
-    }
-}
+use crate::bin::FeatureBinner;
 
 /// Training dataset: stores binned features, labels, and optional weights.
 pub struct Dataset {
-    /// `binned_features[j][i]` is the bin index for row `i`, feature `j`.
-    pub binned_features: Vec<Vec<u8>>,
     pub feature_binners: Vec<FeatureBinner>,
     pub feature_names: Vec<String>,
     pub labels: Float64Array,
@@ -50,30 +24,16 @@ impl Dataset {
     ) -> Self {
         let num_features = features.num_columns();
         let mut feature_binners = Vec::with_capacity(num_features);
-        let mut binned_features = Vec::with_capacity(num_features);
         let mut feature_names = Vec::with_capacity(num_features);
 
         for (field, array) in features.schema().fields().iter().zip(features.columns()) {
-            let name = field.name();
-
-            let binner = if array.data_type() == &DataType::Float64 {
-                FeatureBinner::Numeric(BinMapper::from_array(array.as_primitive(), num_bins, min_data_in_bin))
-            } else if let DataType::Dictionary(_, _) = array.data_type() {
-                FeatureBinner::Categorical(CatMapper::from_dictionary(array.as_ref()))
-            } else {
-                panic!("column '{name}' has unsupported type {:?}; expected Float64 or Dictionary", array.data_type());
-            };
-
-            let bins = binner.array_to_bins(array.as_ref()).unwrap();
-            feature_names.push(name.clone());
-            feature_binners.push(binner);
-            binned_features.push(bins);
+            feature_names.push(field.name().clone());
+            feature_binners.push(FeatureBinner::from_array(array.as_ref(), num_bins, min_data_in_bin));
         }
 
         let max_bins = feature_binners.iter().map(|b| b.num_bins()).max().unwrap_or(num_bins);
 
         Self {
-            binned_features,
             feature_binners,
             feature_names,
             labels: labels.clone(),
@@ -89,8 +49,9 @@ impl Dataset {
 mod tests {
     use super::*;
     use arrow::array::{DictionaryArray, StringArray, UInt32Array};
-    use arrow::datatypes::{Field, Schema, UInt32Type};
+    use arrow::datatypes::{DataType, Field, Schema, UInt32Type};
     use std::sync::Arc;
+    use crate::bin::BinnerKind;
 
     fn make_features() -> RecordBatch {
         let schema = Schema::new(vec![Field::new("x", DataType::Float64, false)]);
@@ -127,7 +88,7 @@ mod tests {
 
         let ds = Dataset::from_arrow(&features, &labels, None, 255, 1);
         assert_eq!(ds.num_features, 1);
-        assert!(matches!(ds.feature_binners[0], FeatureBinner::Categorical(_)));
+        assert!(matches!(ds.feature_binners[0].kind, BinnerKind::Categorical(_)));
         assert_eq!(ds.feature_binners[0].num_bins(), 3);
     }
 }
