@@ -41,7 +41,7 @@ impl Histogram {
     /// Build a histogram by accumulating gradients and hessians for `row_indices`.
     /// This is essentially a group-by-sum operation. Histograms are built for each
     /// feature and for each tree node during training. They aggregate over all rows
-    /// and thus are a bottleneck. We use unsafe code for maximum performance. 
+    /// and thus are a bottleneck. We use unsafe code for maximum performance.
     pub fn build(
         feature_column: &[u8],
         gradients: &[f64],
@@ -51,20 +51,42 @@ impl Histogram {
         row_indices: &[u32],
         num_bins: usize,
     ) -> Self {
-        let mut bins = vec![HistogramBin::default(); num_bins + 1]; 
+        let mut bins = vec![HistogramBin::default(); num_bins + 1];
 
-        for &row in row_indices {
-            let row = row as usize;
-            // SAFETY: row < feature_column.len() (row_indices are valid row indices),
-            // bin_idx <= num_bins (guaranteed by the binners), bins.len() == num_bins + 1.
+        // 4-way unrolled loop: 4 independent bin lookups in flight simultaneously,
+        // allowing the CPU to overlap cache miss latencies for the scatter writes.
+        // SAFETY: all row indices are valid, bin_idx <= num_bins (guaranteed by binners).
+        let chunks = row_indices.chunks_exact(4);
+        let remainder = chunks.remainder();
+        let ptr = bins.as_mut_ptr();
+        for chunk in chunks {
             unsafe {
-                // Use get_unchecked and get_unchecked_mut to avoid (costly) bounds
-                // checks. This loop is executed very often.
+                let r0 = *chunk.get_unchecked(0) as usize;
+                let r1 = *chunk.get_unchecked(1) as usize;
+                let r2 = *chunk.get_unchecked(2) as usize;
+                let r3 = *chunk.get_unchecked(3) as usize;
+
+                let b0 = *feature_column.get_unchecked(r0) as usize;
+                let b1 = *feature_column.get_unchecked(r1) as usize;
+                let b2 = *feature_column.get_unchecked(r2) as usize;
+                let b3 = *feature_column.get_unchecked(r3) as usize;
+
+                let g0 = *gradients.get_unchecked(r0); let h0 = *hessians.get_unchecked(r0);
+                let g1 = *gradients.get_unchecked(r1); let h1 = *hessians.get_unchecked(r1);
+                let g2 = *gradients.get_unchecked(r2); let h2 = *hessians.get_unchecked(r2);
+                let g3 = *gradients.get_unchecked(r3); let h3 = *hessians.get_unchecked(r3);
+
+                (*ptr.add(b0)).sum_gradients += g0; (*ptr.add(b0)).sum_hessians += h0; (*ptr.add(b0)).count += 1;
+                (*ptr.add(b1)).sum_gradients += g1; (*ptr.add(b1)).sum_hessians += h1; (*ptr.add(b1)).count += 1;
+                (*ptr.add(b2)).sum_gradients += g2; (*ptr.add(b2)).sum_hessians += h2; (*ptr.add(b2)).count += 1;
+                (*ptr.add(b3)).sum_gradients += g3; (*ptr.add(b3)).sum_hessians += h3; (*ptr.add(b3)).count += 1;
+            }
+        }
+        for &row in remainder {
+            unsafe {
+                let row = row as usize;
                 let bin_idx = *feature_column.get_unchecked(row) as usize;
-                debug_assert!(bin_idx < bins.len(), "bin index {bin_idx} out of bounds");
-                let bin = bins.get_unchecked_mut(bin_idx);
-                // Safe as the binners guarantee that `feature_column` values are
-                // `<= num_bins`.
+                let bin = &mut *ptr.add(bin_idx);
                 bin.sum_gradients += *gradients.get_unchecked(row);
                 bin.sum_hessians += *hessians.get_unchecked(row);
                 bin.count += 1;
@@ -136,7 +158,7 @@ impl Histogram {
                 let right_count = total_count - left_count;
                 let right_hessian = total_hessian - left_hessian;
                 let right_gradient = total_gradient - left_gradient;
-                
+
                 // gain = score - parent_score
                 // We always compute the score, even if leaf constraints
                 // (min_data_in_leaf, min_sum_hessian_in_leaf) are not met. This allows
@@ -144,7 +166,7 @@ impl Histogram {
                 // could also compute the min_idx and max_idx based on leaf constraints.
                 // Unsure if that would be worth it.
                 let score = calculate_score(left_gradient, left_hessian, parameters.lambda_l1, parameters.lambda_l2) + calculate_score(right_gradient, right_hessian, parameters.lambda_l1, parameters.lambda_l2);
-                
+
                 // Use & instead of && to avoid branching.
                 let leaf_constraint = (left_count >= parameters.min_data_in_leaf as u32) & (right_count >= parameters.min_data_in_leaf as u32) & (left_hessian >= parameters.min_sum_hessian_in_leaf) & (right_hessian >= parameters.min_sum_hessian_in_leaf);
                 // Instead of `if leaf_constraint & (score > best_score)` below, make
@@ -170,11 +192,11 @@ impl Histogram {
                 let right_count = total_count - left_count;
                 let right_hessian = total_hessian - left_hessian;
                 let right_gradient = total_gradient - left_gradient;
-                
+
                 let score = calculate_score(left_gradient, left_hessian, parameters.lambda_l1, parameters.lambda_l2) + calculate_score(right_gradient, right_hessian, parameters.lambda_l1, parameters.lambda_l2);
                 let leaf_constraint = (left_count >= parameters.min_data_in_leaf as u32) & (right_count >= parameters.min_data_in_leaf as u32) & (left_hessian >= parameters.min_sum_hessian_in_leaf) & (right_hessian >= parameters.min_sum_hessian_in_leaf);
                 let score = if leaf_constraint { score } else { f64::NEG_INFINITY };
-    
+
                 if score > best_score {
                     best_score = score;
                     best_threshold = t;
@@ -194,7 +216,7 @@ impl Histogram {
                 let score = calculate_score(left_gradient, left_hessian, parameters.lambda_l1, parameters.lambda_l2) + calculate_score(right_gradient, right_hessian, parameters.lambda_l1, parameters.lambda_l2);
                 let leaf_constraint = (left_count >= parameters.min_data_in_leaf as u32) & (right_count >= parameters.min_data_in_leaf as u32) & (left_hessian >= parameters.min_sum_hessian_in_leaf) & (right_hessian >= parameters.min_sum_hessian_in_leaf);
                 let score = if leaf_constraint { score } else { f64::NEG_INFINITY };
-    
+
                 if score > best_score {
                         best_score = score;
                         best_threshold = t;
@@ -292,11 +314,11 @@ impl Histogram {
             let right_count = total_count - left_count;
             let right_hessian = total_hessian - left_hessian;
             let right_gradient = total_gradient - left_gradient;
-            
+
             let score = calculate_score(left_gradient, left_hessian, parameters.lambda_l1, parameters.lambda_l2) + calculate_score(right_gradient, right_hessian, parameters.lambda_l1, parameters.lambda_l2);
             let leaf_constraint = (left_count >= parameters.min_data_in_leaf as u32) & (right_count >= parameters.min_data_in_leaf as u32) & (left_hessian >= parameters.min_sum_hessian_in_leaf) & (right_hessian >= parameters.min_sum_hessian_in_leaf);
             let score = if leaf_constraint { score } else { f64::NEG_INFINITY };
-    
+
             if score > best_score {
                 best_score = score;
                 best_threshold = t;
