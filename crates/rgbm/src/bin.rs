@@ -8,8 +8,6 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand::seq::IteratorRandom;
 
-use crate::histogram::{Histogram, SplitInfo};
-use crate::parameters::Parameters;
 
 pub enum BinnerKind {
     /// Upper bounds for each bin. The last entry is always +inf.
@@ -88,6 +86,10 @@ impl FeatureBinner {
         }
     }
 
+    pub fn is_categorical(&self) -> bool {
+        matches!(self.kind, BinnerKind::Categorical(_))
+    }
+
     pub fn num_bins(&self) -> usize {
         match &self.kind {
             BinnerKind::Numerical(upper_bounds) => upper_bounds.len(),
@@ -95,12 +97,6 @@ impl FeatureBinner {
         }
     }
 
-    pub fn find_best_split(&self, histogram: &Histogram, total_gradient: f64, total_hessian: f64, total_count: u32, parent_score: f64, p: &Parameters) -> Option<SplitInfo> {
-        match &self.kind {
-            BinnerKind::Numerical(_) => histogram.find_best_numeric_split(total_gradient, total_hessian, total_count, parent_score, p),
-            BinnerKind::Categorical(_) => histogram.find_best_categorical_split(total_gradient, total_hessian, total_count, parent_score, p),
-        }
-    }
 }
 
 /// Greedy bin boundary search over sorted values.

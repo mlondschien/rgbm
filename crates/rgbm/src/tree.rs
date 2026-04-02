@@ -1,9 +1,9 @@
 use arrow::array::{Array, PrimitiveArray};
 use arrow::datatypes::{Float64Type, UInt32Type};
 
-use crate::bin::{BinnerKind, FeatureBinner};
+use crate::bin::BinnerKind;
 use crate::dataset::Dataset;
-use crate::histogram::{Histogram, HistogramBin, SplitInfo, Threshold};
+use crate::histogram::{Histogram, SplitInfo, Threshold};
 use crate::parameters::Parameters;
 use crate::utils::{calculate_score, calculate_weight};
 
@@ -41,7 +41,6 @@ impl Clone for Node {
 }
 
 fn find_best_split(
-    feature_binners: &[FeatureBinner],
     p: &Parameters,
     histograms: &[Histogram],
     total_gradient: f64,
@@ -53,9 +52,9 @@ fn find_best_split(
     if depth >= p.max_depth || (n as usize) < p.min_data_in_leaf * 2 || total_hessian < p.min_sum_hessian_in_leaf * 2.0 {
         return None;
     }
-    (0..feature_binners.len())
+    (0..histograms.len())
         .filter_map(|f| {
-            feature_binners[f].find_best_split(&histograms[f], total_gradient, total_hessian, n, parent_score, p)
+            histograms[f].find_best_split(total_gradient, total_hessian, n, parent_score, p)
                 .map(|s| (f, s))
         })
         .max_by(|a, b| a.1.gain.partial_cmp(&b.1.gain).unwrap())
@@ -83,10 +82,10 @@ impl Tree {
         let total_score = calculate_score(total_gradient, total_hessian, p.lambda_l1, p.lambda_l2);
 
         let histograms: Vec<Histogram> = (0..dataset.num_features)
-            .map(|f| Histogram::build(&dataset.feature_binners[f].bins, gradients, hessians, &all_indices, dataset.feature_binners[f].num_bins()))
+            .map(|f| Histogram::build(&dataset.feature_binners[f].bins, gradients, hessians, &all_indices, dataset.feature_binners[f].num_bins(), dataset.feature_binners[f].is_categorical()))
             .collect();
 
-        let best_split = find_best_split(&dataset.feature_binners, p, &histograms, total_gradient, total_hessian, dataset.num_rows as u32, total_score, 0);
+        let best_split = find_best_split(p, &histograms, total_gradient, total_hessian, dataset.num_rows as u32, total_score, 0);
         let root = self.add_node(calculate_weight(total_gradient, total_hessian, p.lambda_l1, p.lambda_l2), p, 0, dataset.num_rows, histograms, best_split, 0);
 
         let mut leaves = vec![root];
@@ -121,26 +120,26 @@ impl Tree {
             let right_histograms: Vec<Histogram>;
             if left_len < right_len {
                 left_histograms = (0..dataset.num_features)
-                    .map(|f| Histogram::build(&dataset.feature_binners[f].bins, gradients, hessians, &all_indices[left_start..left_start + left_len], dataset.feature_binners[f].num_bins()))
+                    .map(|f| Histogram::build(&dataset.feature_binners[f].bins, gradients, hessians, &all_indices[left_start..left_start + left_len], dataset.feature_binners[f].num_bins(), dataset.feature_binners[f].is_categorical()))
                     .collect();
                 right_histograms = (0..dataset.num_features).map(|f| {
-                    let mut h = Histogram { bins: vec![HistogramBin::default(); left_histograms[f].bins.len()] };
+                    let mut h = Histogram::zeros(left_histograms[f].bins.len(), left_histograms[f].is_categorical);
                     h.subtract(&histograms[f], &left_histograms[f]);
                     h
                 }).collect();
             } else {
                 right_histograms = (0..dataset.num_features)
-                    .map(|f| Histogram::build(&dataset.feature_binners[f].bins, gradients, hessians, &all_indices[right_start..right_start + right_len], dataset.feature_binners[f].num_bins()))
+                    .map(|f| Histogram::build(&dataset.feature_binners[f].bins, gradients, hessians, &all_indices[right_start..right_start + right_len], dataset.feature_binners[f].num_bins(), dataset.feature_binners[f].is_categorical()))
                     .collect();
                 left_histograms = (0..dataset.num_features).map(|f| {
-                    let mut h = Histogram { bins: vec![HistogramBin::default(); right_histograms[f].bins.len()] };
+                    let mut h = Histogram::zeros(right_histograms[f].bins.len(), right_histograms[f].is_categorical);
                     h.subtract(&histograms[f], &right_histograms[f]);
                     h
                 }).collect();
             }
 
-            let left_best_split = find_best_split(&dataset.feature_binners, p, &left_histograms, split.left_gradient, split.left_hessian, left_len as u32, split.left_score, depth + 1);
-            let right_best_split = find_best_split(&dataset.feature_binners, p, &right_histograms, split.right_gradient, split.right_hessian, right_len as u32, split.right_score, depth + 1);
+            let left_best_split = find_best_split(p, &left_histograms, split.left_gradient, split.left_hessian, left_len as u32, split.left_score, depth + 1);
+            let right_best_split = find_best_split(p, &right_histograms, split.right_gradient, split.right_hessian, right_len as u32, split.right_score, depth + 1);
 
             let left_node = self.add_node(calculate_weight(split.left_gradient, split.left_hessian, p.lambda_l1, p.lambda_l2), p, left_start, left_len, left_histograms, left_best_split, depth + 1);
             let right_node = self.add_node(calculate_weight(split.right_gradient, split.right_hessian, p.lambda_l1, p.lambda_l2), p, right_start, right_len, right_histograms, right_best_split, depth + 1);

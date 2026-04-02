@@ -35,9 +35,22 @@ pub struct SplitInfo {
 /// `bins.len() == num_bins + 1`; the last entry is the sentinel bin for missings.
 pub struct Histogram {
     pub bins: Vec<HistogramBin>,
+    pub is_categorical: bool,
 }
 
 impl Histogram {
+    pub fn zeros(n: usize, is_categorical: bool) -> Self {
+        Self { bins: vec![HistogramBin::default(); n], is_categorical }
+    }
+
+    pub fn find_best_split(&self, total_gradient: f64, total_hessian: f64, total_count: u32, parent_score: f64, p: &Parameters) -> Option<SplitInfo> {
+        if self.is_categorical {
+            self.find_best_categorical_split(total_gradient, total_hessian, total_count, parent_score, p)
+        } else {
+            self.find_best_numeric_split(total_gradient, total_hessian, total_count, parent_score, p)
+        }
+    }
+
     /// Build a histogram by accumulating gradients and hessians for `row_indices`.
     /// This is essentially a group-by-sum operation. Histograms are built for each
     /// feature and for each tree node during training. They aggregate over all rows
@@ -50,6 +63,7 @@ impl Histogram {
         // u32 ~ 4 billion rows should be plenty.
         row_indices: &[u32],
         num_bins: usize,
+        is_categorical: bool,
     ) -> Self {
         let mut bins = vec![HistogramBin::default(); num_bins + 1];
 
@@ -93,7 +107,7 @@ impl Histogram {
             }
         }
 
-        Self { bins }
+        Self { bins, is_categorical }
     }
 
     /// Write `parent - child` into `self`. In-place operation.
@@ -379,7 +393,7 @@ mod tests {
         let hessians = vec![1.0; 4];
         let row_indices: Vec<u32> = vec![0, 1, 2, 3];
 
-        let parent = Histogram::build(&feature_column, &gradients, &hessians, &row_indices, num_bins);
+        let parent = Histogram::build(&feature_column, &gradients, &hessians, &row_indices, num_bins, false);
         assert_eq!(parent.bins[0].count, 2);
         assert_approx_eq(parent.bins[0].sum_gradients, 4.0);
         assert_eq!(parent.bins[1].count, 1);
@@ -389,7 +403,7 @@ mod tests {
         assert_eq!(parent.bins[3].count, 0); // sentinel empty
 
         // rows 0 and 2 both fall into bin 0; right = parent - left contains only rows 1 and 3
-        let right = Histogram::build(&feature_column, &gradients, &hessians, &[1u32, 3], num_bins);
+        let right = Histogram::build(&feature_column, &gradients, &hessians, &[1u32, 3], num_bins, false);
         assert_eq!(right.bins[0].count, 0);
         assert_eq!(right.bins[1].count, 1);
         assert_eq!(right.bins[2].count, 1);
@@ -405,7 +419,7 @@ mod tests {
             HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 },
             HistogramBin { sum_gradients:  20.0, sum_hessians: 10.0, count: 10 },
             HistogramBin { sum_gradients:   0.0, sum_hessians:  0.0, count:  0 },
-        ]};
+        ], is_categorical: false };
         let split = hist.find_best_numeric_split(0.0, 30.0, 30, 0.0, &parameters).unwrap();
         assert!(matches!(split.threshold, Threshold::Numeric(1)));
         assert_approx_eq(split.gain, 60.0);
@@ -420,7 +434,7 @@ mod tests {
         let feature_bins = vec![0u8, 1, 2];
         let grads = vec![1.0, 1.0, 1.0];
         let hess = vec![1.0; 3];
-        let hist = Histogram::build(&feature_bins, &grads, &hess, &[0u32, 1, 2], 3);
+        let hist = Histogram::build(&feature_bins, &grads, &hess, &[0u32, 1, 2], 3, false);
         assert!(hist.find_best_numeric_split(3.0, 3.0, 3, 3.0, &p()).is_none());
     }
 
@@ -433,7 +447,7 @@ mod tests {
             HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 },
             HistogramBin { sum_gradients:  20.0, sum_hessians: 10.0, count: 10 },
             HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 }, // sentinel
-        ]};
+        ], is_categorical: false };
         let split = hist.find_best_numeric_split(0.0, 30.0, 30, 0.0, &parameters).unwrap();
         assert_approx_eq(split.gain, 60.0);
         assert!(split.missing_goes_left);
@@ -449,7 +463,7 @@ mod tests {
             HistogramBin { sum_gradients:  20.0, sum_hessians: 10.0, count: 10 },
             HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 },
             HistogramBin { sum_gradients:   0.0, sum_hessians:  0.0, count:  0 },
-        ]};
+        ], is_categorical: true };
         let split = hist.find_best_categorical_split(0.0, 30.0, 30, 0.0, &parameters).unwrap();
         assert_approx_eq(split.gain, 60.0);
         match &split.threshold {
@@ -469,7 +483,7 @@ mod tests {
         let feature_bins: Vec<u8> = (0..10).map(|i| if i < 5 { 0 } else { 1 }).collect();
         let grads: Vec<f64> = (0..10).map(|i| if i < 5 { 1.0 } else { -5.0 }).collect();
         let hess = vec![1.0; 10];
-        let hist = Histogram::build(&feature_bins, &grads, &hess, &(0..10u32).collect::<Vec<_>>(), 1);
+        let hist = Histogram::build(&feature_bins, &grads, &hess, &(0..10u32).collect::<Vec<_>>(), 1, true);
         let (g, h, c) = hist.bins.iter().fold((0.0, 0.0, 0u32), |(g, h, c), b| (g + b.sum_gradients, h + b.sum_hessians, c + b.count));
         let split = hist.find_best_categorical_split(g, h, c, 0.0, &p()).unwrap();
         assert!(split.missing_goes_left);
@@ -483,7 +497,7 @@ mod tests {
             HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 },
             HistogramBin { sum_gradients:  10.0, sum_hessians: 10.0, count: 10 },
             HistogramBin { sum_gradients:   0.0, sum_hessians:  0.0, count:  0 },
-        ]};
+        ], is_categorical: false };
         assert!(hist.find_best_numeric_split(0.0, 20.0, 20, 0.0, &parameters).is_none());
     }
 }
