@@ -1,14 +1,23 @@
 //! Histogram-based gradient and hessian accumulation, and best-split finding.
 
+use crate::dataset::FeatureBundle;
 use crate::parameters::Parameters;
 use crate::utils::calculate_score;
 
 
 #[derive(Clone, Default, Debug)]
+#[repr(C)]  // group fields into 16 bytes for optimal SIMD processing
 pub struct HistogramBin {
     pub sum_gradients: f64,
     pub sum_hessians: f64,
-    pub count: u32,
+}
+
+impl HistogramBin {
+    #[inline(always)]
+    pub fn add(&mut self, gh: [f64; 2]) {
+        self.sum_gradients += gh[0];
+        self.sum_hessians += gh[1];
+    }
 }
 
 
@@ -31,8 +40,6 @@ pub struct SplitInfo {
 }
 
 /// Histogram for one feature over a set of rows.
-///
-/// `bins.len() == num_bins + 1`; the last entry is the sentinel bin for missings.
 pub struct Histogram {
     pub bins: Vec<HistogramBin>,
     pub is_categorical: bool,
@@ -43,71 +50,61 @@ impl Histogram {
         Self { bins: vec![HistogramBin::default(); n], is_categorical }
     }
 
-    pub fn find_best_split(&self, total_gradient: f64, total_hessian: f64, total_count: u32, parent_score: f64, p: &Parameters) -> Option<SplitInfo> {
+    pub fn find_best_split(&self, total_gradient: f64, total_hessian: f64, parent_score: f64, p: &Parameters) -> Option<SplitInfo> {
         if self.is_categorical {
-            self.find_best_categorical_split(total_gradient, total_hessian, total_count, parent_score, p)
+            self.find_best_categorical_split(total_gradient, total_hessian, parent_score, p)
         } else {
-            self.find_best_numeric_split(total_gradient, total_hessian, total_count, parent_score, p)
+            self.find_best_numeric_split(total_gradient, total_hessian, parent_score, p)
         }
     }
 
-    /// Build a histogram by accumulating gradients and hessians for `row_indices`.
-    /// This is essentially a group-by-sum operation. Histograms are built for each
-    /// feature and for each tree node during training. They aggregate over all rows
-    /// and thus are a bottleneck. We use unsafe code for maximum performance.
-    pub fn build(
-        feature_column: &[u8],
-        gradients: &[f64],
-        hessians: &[f64],
-        // using u32 for row indices saves some memory that gets copied around a lot.
-        // u32 ~ 4 billion rows should be plenty.
-        row_indices: &[u32],
-        num_bins: usize,
-        is_categorical: bool,
-    ) -> Self {
-        let mut bins = vec![HistogramBin::default(); num_bins + 1];
+    /// Build histograms for all features in a bundle in one pass over row_indices.
+    /// One 32-bit load per row replaces up to 4 separate byte loads.
+    /// SAFETY: bin values are in 0..num_bins[i] (sentinel is at num_bins[i] - 1),
+    /// histograms are sized num_bins[i].
+    pub fn build(bundle: &FeatureBundle, grad_hess: &[[f64; 2]], row_indices: &[u32]) -> Vec<Self> {
+        // unwrap_or(1) for the case where the bundle has fewer than 4 features.
+        let n0 = bundle.num_bins.get(0).copied().unwrap_or(1);
+        let n1 = bundle.num_bins.get(1).copied().unwrap_or(1);
+        let n2 = bundle.num_bins.get(2).copied().unwrap_or(1);
+        let n3 = bundle.num_bins.get(3).copied().unwrap_or(1);
 
-        // 4-way unrolled loop: 4 independent bin lookups in flight simultaneously,
-        // allowing the CPU to overlap cache miss latencies for the scatter writes.
-        // SAFETY: all row indices are valid, bin_idx <= num_bins (guaranteed by binners).
-        let chunks = row_indices.chunks_exact(4);
-        let remainder = chunks.remainder();
-        let ptr = bins.as_mut_ptr();
-        for chunk in chunks {
+        let mut h0 = vec![HistogramBin::default(); n0];
+        let mut h1 = vec![HistogramBin::default(); n1];
+        let mut h2 = vec![HistogramBin::default(); n2];
+        let mut h3 = vec![HistogramBin::default(); n3];
+
+        let p0 = h0.as_mut_ptr();
+        let p1 = h1.as_mut_ptr();
+        let p2 = h2.as_mut_ptr();
+        let p3 = h3.as_mut_ptr();
+
+        for &row in row_indices {
+            let row = row as usize;
             unsafe {
-                let r0 = *chunk.get_unchecked(0) as usize;
-                let r1 = *chunk.get_unchecked(1) as usize;
-                let r2 = *chunk.get_unchecked(2) as usize;
-                let r3 = *chunk.get_unchecked(3) as usize;
+                let gh = *grad_hess.get_unchecked(row);
+                let packed = *bundle.packed_bins.get_unchecked(row);
 
-                let b0 = *feature_column.get_unchecked(r0) as usize;
-                let b1 = *feature_column.get_unchecked(r1) as usize;
-                let b2 = *feature_column.get_unchecked(r2) as usize;
-                let b3 = *feature_column.get_unchecked(r3) as usize;
+                let b0 = (packed & 0xFF) as usize;
+                let b1 = ((packed >> 8) & 0xFF) as usize;
+                let b2 = ((packed >> 16) & 0xFF) as usize;
+                let b3 = (packed >> 24) as usize;
 
-                let g0 = *gradients.get_unchecked(r0); let h0 = *hessians.get_unchecked(r0);
-                let g1 = *gradients.get_unchecked(r1); let h1 = *hessians.get_unchecked(r1);
-                let g2 = *gradients.get_unchecked(r2); let h2 = *hessians.get_unchecked(r2);
-                let g3 = *gradients.get_unchecked(r3); let h3 = *hessians.get_unchecked(r3);
-
-                (*ptr.add(b0)).sum_gradients += g0; (*ptr.add(b0)).sum_hessians += h0; (*ptr.add(b0)).count += 1;
-                (*ptr.add(b1)).sum_gradients += g1; (*ptr.add(b1)).sum_hessians += h1; (*ptr.add(b1)).count += 1;
-                (*ptr.add(b2)).sum_gradients += g2; (*ptr.add(b2)).sum_hessians += h2; (*ptr.add(b2)).count += 1;
-                (*ptr.add(b3)).sum_gradients += g3; (*ptr.add(b3)).sum_hessians += h3; (*ptr.add(b3)).count += 1;
-            }
-        }
-        for &row in remainder {
-            unsafe {
-                let row = row as usize;
-                let bin_idx = *feature_column.get_unchecked(row) as usize;
-                let bin = &mut *ptr.add(bin_idx);
-                bin.sum_gradients += *gradients.get_unchecked(row);
-                bin.sum_hessians += *hessians.get_unchecked(row);
-                bin.count += 1;
+                (*p0.add(b0)).add(gh);
+                (*p1.add(b1)).add(gh);
+                (*p2.add(b2)).add(gh);
+                (*p3.add(b3)).add(gh);
             }
         }
 
-        Self { bins, is_categorical }
+        let mut results = vec![
+            Self { bins: h0, is_categorical: bundle.is_categorical.get(0).copied().unwrap_or(false) },
+            Self { bins: h1, is_categorical: bundle.is_categorical.get(1).copied().unwrap_or(false) },
+            Self { bins: h2, is_categorical: bundle.is_categorical.get(2).copied().unwrap_or(false) },
+            Self { bins: h3, is_categorical: bundle.is_categorical.get(3).copied().unwrap_or(false) },
+        ];
+        results.truncate(bundle.count);
+        results
     }
 
     /// Write `parent - child` into `self`. In-place operation.
@@ -118,7 +115,6 @@ impl Histogram {
         for (s, (p, c)) in self.bins.iter_mut().zip(parent.bins.iter().zip(child.bins.iter())) {
             s.sum_gradients = p.sum_gradients - c.sum_gradients;
             s.sum_hessians = p.sum_hessians - c.sum_hessians;
-            s.count = p.count - c.count;
         }
     }
 
@@ -127,7 +123,6 @@ impl Histogram {
         &self,
         total_gradient: f64,
         total_hessian: f64,
-        total_count: u32,
         parent_score: f64,
         parameters: &Parameters,
     ) -> Option<SplitInfo> {
@@ -138,21 +133,17 @@ impl Histogram {
 
         let mut left_gradient = 0.0;
         let mut left_hessian = 0.0;
-        let mut left_count = 0u32;
 
         let mut cumsum_gradients = Vec::with_capacity(num_bins);
         let mut cumsum_hessians = Vec::with_capacity(num_bins);
-        let mut cumsum_counts = Vec::with_capacity(num_bins);
 
         // Pass 1 through the data: Compute cumulative sums.
         for bin in &self.bins[..num_bins] {
             left_gradient += bin.sum_gradients;
             left_hessian += bin.sum_hessians;
-            left_count += bin.count;
 
             cumsum_gradients.push(left_gradient);
             cumsum_hessians.push(left_hessian);
-            cumsum_counts.push(left_count);
         }
 
         let mut best_score = f64::NEG_INFINITY;
@@ -161,54 +152,44 @@ impl Histogram {
 
         // Code duplication: Two loops with the same gain calculation but with the
         // branch on the outside
-        if sentinel.count == 0 {
+        if sentinel.sum_hessians == 0.0 {
             // Pass 2: SIMD-friendly gain calculation. The goal is to have no loop-
             // carried dependencies so the compiler can perfectly unroll and vectorize.
-            for t in 0..num_bins {
+            // Stop at num_bins - 1: threshold t means bins 0..=t go left, so right
+            // must have at least one non-sentinel bin (t = num_bins - 1 is degenerate).
+            for t in 0..num_bins - 1 {
                 let left_gradient = cumsum_gradients[t];
                 let left_hessian = cumsum_hessians[t];
-                let left_count = cumsum_counts[t];
-
-                let right_count = total_count - left_count;
                 let right_hessian = total_hessian - left_hessian;
                 let right_gradient = total_gradient - left_gradient;
 
                 // gain = score - parent_score
                 // We always compute the score, even if leaf constraints
-                // (min_data_in_leaf, min_sum_hessian_in_leaf) are not met. This allows
-                // the compiler to perfectly unroll without any branching issues. One
-                // could also compute the min_idx and max_idx based on leaf constraints.
-                // Unsure if that would be worth it.
+                // (min_sum_hessian_in_leaf) are not met. This allows the compiler to
+                // perfectly unroll without any branching issues.
                 let score = calculate_score(left_gradient, left_hessian, parameters.lambda_l1, parameters.lambda_l2) + calculate_score(right_gradient, right_hessian, parameters.lambda_l1, parameters.lambda_l2);
 
                 // Use & instead of && to avoid branching.
-                let leaf_constraint = (left_count >= parameters.min_data_in_leaf as u32) & (right_count >= parameters.min_data_in_leaf as u32) & (left_hessian >= parameters.min_sum_hessian_in_leaf) & (right_hessian >= parameters.min_sum_hessian_in_leaf);
-                // Instead of `if leaf_constraint & (score > best_score)` below, make
-                // the if/else branch as simple as possible to make it more likely the
-                // compiler autovectorizes.
+                let leaf_constraint = (left_hessian >= parameters.min_sum_hessian_in_leaf) & (right_hessian >= parameters.min_sum_hessian_in_leaf);
                 let score = if leaf_constraint { score } else { f64::NEG_INFINITY };
                 if score > best_score {
                     best_score = score;
                     best_threshold = t;
                     // If no missings at train time but some at test time, send missings
                     // to the larger side of the split.
-                    best_missing_goes_left = left_count > right_count;
+                    best_missing_goes_left = left_hessian > right_hessian;
                 }
             }
         } else {
-            for t in 0..num_bins {
+            for t in 0..num_bins.saturating_sub(1) {
                 // Same code as above. First compute score for missing_goes_left = false.
-                // Note that total_count includes the missing values bin.
                 let left_gradient = cumsum_gradients[t];
                 let left_hessian = cumsum_hessians[t];
-                let left_count = cumsum_counts[t];
-
-                let right_count = total_count - left_count;
                 let right_hessian = total_hessian - left_hessian;
                 let right_gradient = total_gradient - left_gradient;
 
                 let score = calculate_score(left_gradient, left_hessian, parameters.lambda_l1, parameters.lambda_l2) + calculate_score(right_gradient, right_hessian, parameters.lambda_l1, parameters.lambda_l2);
-                let leaf_constraint = (left_count >= parameters.min_data_in_leaf as u32) & (right_count >= parameters.min_data_in_leaf as u32) & (left_hessian >= parameters.min_sum_hessian_in_leaf) & (right_hessian >= parameters.min_sum_hessian_in_leaf);
+                let leaf_constraint = (left_hessian >= parameters.min_sum_hessian_in_leaf) & (right_hessian >= parameters.min_sum_hessian_in_leaf);
                 let score = if leaf_constraint { score } else { f64::NEG_INFINITY };
 
                 if score > best_score {
@@ -218,23 +199,20 @@ impl Histogram {
                 }
 
                 // Now compute score for missing_goes_left = true.
-                // new assignments so compiler knows there's no depdendencies
-                let left_count = left_count + sentinel.count;
+                // new assignments so compiler knows there's no dependencies
                 let left_hessian = left_hessian + sentinel.sum_hessians;
                 let left_gradient = left_gradient + sentinel.sum_gradients;
-
-                let right_count = right_count - sentinel.count;
                 let right_hessian = right_hessian - sentinel.sum_hessians;
                 let right_gradient = right_gradient - sentinel.sum_gradients;
 
                 let score = calculate_score(left_gradient, left_hessian, parameters.lambda_l1, parameters.lambda_l2) + calculate_score(right_gradient, right_hessian, parameters.lambda_l1, parameters.lambda_l2);
-                let leaf_constraint = (left_count >= parameters.min_data_in_leaf as u32) & (right_count >= parameters.min_data_in_leaf as u32) & (left_hessian >= parameters.min_sum_hessian_in_leaf) & (right_hessian >= parameters.min_sum_hessian_in_leaf);
+                let leaf_constraint = (left_hessian >= parameters.min_sum_hessian_in_leaf) & (right_hessian >= parameters.min_sum_hessian_in_leaf);
                 let score = if leaf_constraint { score } else { f64::NEG_INFINITY };
 
                 if score > best_score {
-                        best_score = score;
-                        best_threshold = t;
-                        best_missing_goes_left = true;
+                    best_score = score;
+                    best_threshold = t;
+                    best_missing_goes_left = true;
                 }
             }
         }
@@ -267,7 +245,6 @@ impl Histogram {
         &self,
         total_gradient: f64,
         total_hessian: f64,
-        total_count: u32,
         parent_score: f64,
         parameters: &Parameters,
     ) -> Option<SplitInfo> {
@@ -283,7 +260,7 @@ impl Histogram {
         let mut categorical_order: Vec<(f64, usize)> = Vec::with_capacity(num_bins + 1);
         for k in 0..=num_bins {
             let bin = &self.bins[k];
-            if bin.count > 0 {
+            if bin.sum_hessians > 0.0 {
                 let ratio = bin.sum_gradients / (bin.sum_hessians + parameters.lambda_l2);
                 categorical_order.push((ratio, k));
             }
@@ -298,39 +275,33 @@ impl Histogram {
 
         let mut cumsum_gradients = Vec::with_capacity(num_active_bins);
         let mut cumsum_hessians = Vec::with_capacity(num_active_bins);
-        let mut cumsum_counts = Vec::with_capacity(num_active_bins);
 
         let mut left_gradient = 0.0;
         let mut left_hessian = 0.0;
-        let mut left_count = 0u32;
 
         // PASS 2: Compute cumsums over the SORTED categorical order
         for &(_, k) in &categorical_order {
             let bin = &self.bins[k];
             left_gradient += bin.sum_gradients;
             left_hessian += bin.sum_hessians;
-            left_count += bin.count;
 
             cumsum_gradients.push(left_gradient);
             cumsum_hessians.push(left_hessian);
-            cumsum_counts.push(left_count);
         }
 
         let mut best_score = f64::NEG_INFINITY;
         let mut best_threshold = 0usize;
 
         // PASS 3: SIMD-friendly gain calculation.
-        for t in 0..num_active_bins {
+        for t in 0..num_active_bins.saturating_sub(1){
             let left_gradient = cumsum_gradients[t];
             let left_hessian = cumsum_hessians[t];
-            let left_count = cumsum_counts[t];
 
-            let right_count = total_count - left_count;
             let right_hessian = total_hessian - left_hessian;
             let right_gradient = total_gradient - left_gradient;
 
             let score = calculate_score(left_gradient, left_hessian, parameters.lambda_l1, parameters.lambda_l2) + calculate_score(right_gradient, right_hessian, parameters.lambda_l1, parameters.lambda_l2);
-            let leaf_constraint = (left_count >= parameters.min_data_in_leaf as u32) & (right_count >= parameters.min_data_in_leaf as u32) & (left_hessian >= parameters.min_sum_hessian_in_leaf) & (right_hessian >= parameters.min_sum_hessian_in_leaf);
+            let leaf_constraint = (left_hessian >= parameters.min_sum_hessian_in_leaf) & (right_hessian >= parameters.min_sum_hessian_in_leaf);
             let score = if leaf_constraint { score } else { f64::NEG_INFINITY };
 
             if score > best_score {
@@ -375,6 +346,7 @@ impl Histogram {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::FeatureBundle;
     use crate::parameters::Parameters;
 
     fn assert_approx_eq(a: f64, b: f64) {
@@ -382,31 +354,43 @@ mod tests {
     }
 
     fn p() -> Parameters {
-        Parameters { min_data_in_leaf: 1, min_sum_hessian_in_leaf: 0.0, ..Parameters::default() }
+        Parameters { min_sum_hessian_in_leaf: 0.0, ..Parameters::default() }
+    }
+
+    fn make_bundle(bins: &[u8], num_bins: usize, is_categorical: bool) -> FeatureBundle {
+        FeatureBundle {
+            packed_bins: bins.iter().map(|&b| b as u32).collect(),
+            feature_indices: vec![0],
+            num_bins: vec![num_bins],
+            is_categorical: vec![is_categorical],
+            count: 1,
+        }
+    }
+
+    fn make_gh(gradients: &[f64], hessians: &[f64]) -> Vec<[f64; 2]> {
+        gradients.iter().zip(hessians).map(|(&g, &h)| [g, h]).collect()
     }
 
     #[test]
     fn test_histogram_build_and_subtract() {
-        let num_bins = 3;
+        let num_bins = 4; // 3 regular bins (0,1,2) + 1 sentinel (3)
         let feature_column = vec![0u8, 1, 0, 2];
-        let gradients = vec![1.0, 2.0, 3.0, 4.0];
-        let hessians = vec![1.0; 4];
+        let gh = make_gh(&[1.0, 2.0, 3.0, 4.0], &[1.0; 4]);
+        let bundle = make_bundle(&feature_column, num_bins, false);
         let row_indices: Vec<u32> = vec![0, 1, 2, 3];
 
-        let parent = Histogram::build(&feature_column, &gradients, &hessians, &row_indices, num_bins, false);
-        assert_eq!(parent.bins[0].count, 2);
+        let parent = Histogram::build(&bundle, &gh, &row_indices).remove(0);
         assert_approx_eq(parent.bins[0].sum_gradients, 4.0);
-        assert_eq!(parent.bins[1].count, 1);
+        assert_approx_eq(parent.bins[0].sum_hessians, 2.0);
         assert_approx_eq(parent.bins[1].sum_gradients, 2.0);
-        assert_eq!(parent.bins[2].count, 1);
         assert_approx_eq(parent.bins[2].sum_gradients, 4.0);
-        assert_eq!(parent.bins[3].count, 0); // sentinel empty
+        assert_approx_eq(parent.bins[3].sum_hessians, 0.0); // sentinel empty
 
         // rows 0 and 2 both fall into bin 0; right = parent - left contains only rows 1 and 3
-        let right = Histogram::build(&feature_column, &gradients, &hessians, &[1u32, 3], num_bins, false);
-        assert_eq!(right.bins[0].count, 0);
-        assert_eq!(right.bins[1].count, 1);
-        assert_eq!(right.bins[2].count, 1);
+        let right = Histogram::build(&bundle, &gh, &[1u32, 3]).remove(0);
+        assert_approx_eq(right.bins[0].sum_hessians, 0.0);
+        assert_approx_eq(right.bins[1].sum_gradients, 2.0);
+        assert_approx_eq(right.bins[2].sum_gradients, 4.0);
     }
 
     #[test]
@@ -415,12 +399,12 @@ mod tests {
         // No missings: missing_goes_left = left_count(20) > right_count(10).
         let parameters = p();
         let hist = Histogram { bins: vec![
-            HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 },
-            HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 },
-            HistogramBin { sum_gradients:  20.0, sum_hessians: 10.0, count: 10 },
-            HistogramBin { sum_gradients:   0.0, sum_hessians:  0.0, count:  0 },
+            HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0 },
+            HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0 },
+            HistogramBin { sum_gradients:  20.0, sum_hessians: 10.0 },
+            HistogramBin { sum_gradients:   0.0, sum_hessians:  0.0 },
         ], is_categorical: false };
-        let split = hist.find_best_numeric_split(0.0, 30.0, 30, 0.0, &parameters).unwrap();
+        let split = hist.find_best_numeric_split(0.0, 30.0, 0.0, &parameters).unwrap();
         assert!(matches!(split.threshold, Threshold::Numeric(1)));
         assert_approx_eq(split.gain, 60.0);
         assert_approx_eq(split.left_score, 20.0);
@@ -431,11 +415,10 @@ mod tests {
     #[test]
     fn test_find_best_numeric_no_split_when_uniform() {
         // Uniform gradients: every split yields the same score as the parent.
-        let feature_bins = vec![0u8, 1, 2];
-        let grads = vec![1.0, 1.0, 1.0];
-        let hess = vec![1.0; 3];
-        let hist = Histogram::build(&feature_bins, &grads, &hess, &[0u32, 1, 2], 3, false);
-        assert!(hist.find_best_numeric_split(3.0, 3.0, 3, 3.0, &p()).is_none());
+        let bundle = make_bundle(&[0u8, 1, 2], 3, false);
+        let gh = make_gh(&[1.0, 1.0, 1.0], &[1.0; 3]);
+        let hist = Histogram::build(&bundle, &gh, &[0u32, 1, 2]).remove(0);
+        assert!(hist.find_best_numeric_split(3.0, 3.0, 3.0, &p()).is_none());
     }
 
     #[test]
@@ -444,11 +427,11 @@ mod tests {
         // missing_goes_right: left G=-10,H=10 → 10; right G=10,H=20 → 5; gain=15.
         let parameters = p();
         let hist = Histogram { bins: vec![
-            HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 },
-            HistogramBin { sum_gradients:  20.0, sum_hessians: 10.0, count: 10 },
-            HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 }, // sentinel
+            HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0 },
+            HistogramBin { sum_gradients:  20.0, sum_hessians: 10.0 },
+            HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0 }, // sentinel
         ], is_categorical: false };
-        let split = hist.find_best_numeric_split(0.0, 30.0, 30, 0.0, &parameters).unwrap();
+        let split = hist.find_best_numeric_split(0.0, 30.0, 0.0, &parameters).unwrap();
         assert_approx_eq(split.gain, 60.0);
         assert!(split.missing_goes_left);
     }
@@ -459,12 +442,12 @@ mod tests {
         // Fisher sorting groups 0 and 2 into left prefix → gain = 400/20 + 400/10 = 60.
         let parameters = p();
         let hist = Histogram { bins: vec![
-            HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 },
-            HistogramBin { sum_gradients:  20.0, sum_hessians: 10.0, count: 10 },
-            HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 },
-            HistogramBin { sum_gradients:   0.0, sum_hessians:  0.0, count:  0 },
+            HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0 },
+            HistogramBin { sum_gradients:  20.0, sum_hessians: 10.0 },
+            HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0 },
+            HistogramBin { sum_gradients:   0.0, sum_hessians:  0.0 },
         ], is_categorical: true };
-        let split = hist.find_best_categorical_split(0.0, 30.0, 30, 0.0, &parameters).unwrap();
+        let split = hist.find_best_categorical_split(0.0, 30.0, 0.0, &parameters).unwrap();
         assert_approx_eq(split.gain, 60.0);
         match &split.threshold {
             Threshold::Categorical(goes_left) => {
@@ -482,22 +465,12 @@ mod tests {
         // Sentinel has strongly negative gradient: optimal to send missings left.
         let feature_bins: Vec<u8> = (0..10).map(|i| if i < 5 { 0 } else { 1 }).collect();
         let grads: Vec<f64> = (0..10).map(|i| if i < 5 { 1.0 } else { -5.0 }).collect();
-        let hess = vec![1.0; 10];
-        let hist = Histogram::build(&feature_bins, &grads, &hess, &(0..10u32).collect::<Vec<_>>(), 1, true);
-        let (g, h, c) = hist.bins.iter().fold((0.0, 0.0, 0u32), |(g, h, c), b| (g + b.sum_gradients, h + b.sum_hessians, c + b.count));
-        let split = hist.find_best_categorical_split(g, h, c, 0.0, &p()).unwrap();
+        let gh = make_gh(&grads, &vec![1.0; 10]);
+        let bundle = make_bundle(&feature_bins, 2, true); // 1 category + 1 sentinel
+        let hist = Histogram::build(&bundle, &gh, &(0..10u32).collect::<Vec<_>>()).remove(0);
+        let (g, h) = hist.bins.iter().fold((0.0, 0.0), |(g, h), b| (g + b.sum_gradients, h + b.sum_hessians));
+        let split = hist.find_best_categorical_split(g, h, 0.0, &p()).unwrap();
         assert!(split.missing_goes_left);
     }
 
-    #[test]
-    fn test_leaf_constraints() {
-        // Mathematically a split exists, but both children would have only 10 rows < min_data_in_leaf=15.
-        let parameters = Parameters { min_data_in_leaf: 15, ..p() };
-        let hist = Histogram { bins: vec![
-            HistogramBin { sum_gradients: -10.0, sum_hessians: 10.0, count: 10 },
-            HistogramBin { sum_gradients:  10.0, sum_hessians: 10.0, count: 10 },
-            HistogramBin { sum_gradients:   0.0, sum_hessians:  0.0, count:  0 },
-        ], is_categorical: false };
-        assert!(hist.find_best_numeric_split(0.0, 20.0, 20, 0.0, &parameters).is_none());
-    }
 }

@@ -1,7 +1,7 @@
 use arrow::array::{Array, PrimitiveArray};
 use arrow::datatypes::{Float64Type, UInt32Type};
 
-use crate::bin::BinnerKind;
+use crate::bin::FeatureBinner;
 use crate::dataset::Dataset;
 use crate::histogram::{Histogram, SplitInfo, Threshold};
 use crate::parameters::Parameters;
@@ -45,16 +45,15 @@ fn find_best_split(
     histograms: &[Histogram],
     total_gradient: f64,
     total_hessian: f64,
-    n: u32,
     parent_score: f64,
     depth: usize,
 ) -> Option<(usize, SplitInfo)> {
-    if depth >= p.max_depth || (n as usize) < p.min_data_in_leaf * 2 || total_hessian < p.min_sum_hessian_in_leaf * 2.0 {
+    if depth >= p.max_depth || total_hessian < p.min_sum_hessian_in_leaf * 2.0 {
         return None;
     }
     (0..histograms.len())
         .filter_map(|f| {
-            histograms[f].find_best_split(total_gradient, total_hessian, n, parent_score, p)
+            histograms[f].find_best_split(total_gradient, total_hessian, parent_score, p)
                 .map(|s| (f, s))
         })
         .max_by(|a, b| a.1.gain.partial_cmp(&b.1.gain).unwrap())
@@ -70,22 +69,23 @@ impl Tree {
         Self { nodes: Vec::with_capacity(2 * max_leaves) }
     }
 
-    pub fn fit(&mut self, dataset: &Dataset, gradients: &[f64], hessians: &[f64], p: &Parameters) -> Vec<u32> {
+    pub fn fit(&mut self, dataset: &Dataset, grad_hess: &[[f64; 2]], p: &Parameters) -> Vec<u32> {
         self.nodes.clear();
         let mut leaf_indices = vec![0u32; dataset.num_rows];
         let mut left_buffer = vec![0u32; dataset.num_rows];
         let mut right_buffer = vec![0u32; dataset.num_rows];
         let mut all_indices: Vec<u32> = (0..dataset.num_rows as u32).collect();
 
-        let total_gradient: f64 = gradients.iter().sum();
-        let total_hessian: f64 = hessians.iter().sum();
+        let total_gradient: f64 = grad_hess.iter().map(|gh| gh[0]).sum();
+        let total_hessian: f64 = grad_hess.iter().map(|gh| gh[1]).sum();
         let total_score = calculate_score(total_gradient, total_hessian, p.lambda_l1, p.lambda_l2);
 
-        let histograms: Vec<Histogram> = (0..dataset.num_features)
-            .map(|f| Histogram::build(&dataset.feature_binners[f].bins, gradients, hessians, &all_indices, dataset.feature_binners[f].num_bins(), dataset.feature_binners[f].is_categorical()))
-            .collect();
+        let mut histograms: Vec<Histogram> = Vec::with_capacity(dataset.num_features);
+        for b in &dataset.feature_bundles {
+            histograms.extend(Histogram::build(b, grad_hess, &all_indices));
+        }
 
-        let best_split = find_best_split(p, &histograms, total_gradient, total_hessian, dataset.num_rows as u32, total_score, 0);
+        let best_split = find_best_split(p, &histograms, total_gradient, total_hessian, total_score, 0);
         let root = self.add_node(calculate_weight(total_gradient, total_hessian, p.lambda_l1, p.lambda_l2), p, 0, dataset.num_rows, histograms, best_split, 0);
 
         let mut leaves = vec![root];
@@ -116,21 +116,23 @@ impl Tree {
             let right_len = len - split_pos;
 
             // Build histograms for the smaller child; subtract for the larger.
-            let left_histograms: Vec<Histogram>;
-            let right_histograms: Vec<Histogram>;
+            let mut left_histograms: Vec<Histogram>;
+            let mut right_histograms: Vec<Histogram>;
             if left_len < right_len {
-                left_histograms = (0..dataset.num_features)
-                    .map(|f| Histogram::build(&dataset.feature_binners[f].bins, gradients, hessians, &all_indices[left_start..left_start + left_len], dataset.feature_binners[f].num_bins(), dataset.feature_binners[f].is_categorical()))
-                    .collect();
+                left_histograms = Vec::with_capacity(dataset.num_features);
+                for b in &dataset.feature_bundles {
+                    left_histograms.extend(Histogram::build(b, grad_hess, &all_indices[left_start..left_start + left_len]));
+                }
                 right_histograms = (0..dataset.num_features).map(|f| {
                     let mut h = Histogram::zeros(left_histograms[f].bins.len(), left_histograms[f].is_categorical);
                     h.subtract(&histograms[f], &left_histograms[f]);
                     h
                 }).collect();
             } else {
-                right_histograms = (0..dataset.num_features)
-                    .map(|f| Histogram::build(&dataset.feature_binners[f].bins, gradients, hessians, &all_indices[right_start..right_start + right_len], dataset.feature_binners[f].num_bins(), dataset.feature_binners[f].is_categorical()))
-                    .collect();
+                right_histograms = Vec::with_capacity(dataset.num_features);
+                for b in &dataset.feature_bundles {
+                    right_histograms.extend(Histogram::build(b, grad_hess, &all_indices[right_start..right_start + right_len]));
+                }
                 left_histograms = (0..dataset.num_features).map(|f| {
                     let mut h = Histogram::zeros(right_histograms[f].bins.len(), right_histograms[f].is_categorical);
                     h.subtract(&histograms[f], &right_histograms[f]);
@@ -138,16 +140,16 @@ impl Tree {
                 }).collect();
             }
 
-            let left_best_split = find_best_split(p, &left_histograms, split.left_gradient, split.left_hessian, left_len as u32, split.left_score, depth + 1);
-            let right_best_split = find_best_split(p, &right_histograms, split.right_gradient, split.right_hessian, right_len as u32, split.right_score, depth + 1);
+            let left_best_split = find_best_split(p, &left_histograms, split.left_gradient, split.left_hessian, split.left_score, depth + 1);
+            let right_best_split = find_best_split(p, &right_histograms, split.right_gradient, split.right_hessian, split.right_score, depth + 1);
 
             let left_node = self.add_node(calculate_weight(split.left_gradient, split.left_hessian, p.lambda_l1, p.lambda_l2), p, left_start, left_len, left_histograms, left_best_split, depth + 1);
             let right_node = self.add_node(calculate_weight(split.right_gradient, split.right_hessian, p.lambda_l1, p.lambda_l2), p, right_start, right_len, right_histograms, right_best_split, depth + 1);
 
             let threshold = match &split.threshold {
-                Threshold::Numeric(bin) => FinalThreshold::Numeric(match &dataset.feature_binners[best_f].kind {
-                    BinnerKind::Numerical(upper_bounds) => upper_bounds[*bin as usize],
-                    BinnerKind::Categorical(_) => panic!("numeric split on categorical feature"),
+                Threshold::Numeric(bin) => FinalThreshold::Numeric(match &dataset.feature_binners[best_f] {
+                    FeatureBinner::Numerical(upper_bounds) => upper_bounds[*bin as usize],
+                    FeatureBinner::Categorical(_) => panic!("numeric split on categorical feature"),
                 }),
                 Threshold::Categorical(gl) => FinalThreshold::Categorical(gl.clone()),
             };
@@ -225,7 +227,9 @@ impl Tree {
     }
 
     fn partition_indices(&self, dataset: &Dataset, indices: &mut [u32], feature: usize, split: &SplitInfo, left_buffer: &mut [u32], right_buffer: &mut [u32]) -> usize {
-        let col = &dataset.feature_binners[feature].bins;
+        let bundle_idx = feature / 4;
+        let shift = (feature % 4) * 8;
+        let packed_bins = &dataset.feature_bundles[bundle_idx].packed_bins;
         let sentinel = dataset.feature_binners[feature].num_bins() as u8;
         let missing = split.missing_goes_left as usize;
         let mut left_count = 0usize;
@@ -235,7 +239,7 @@ impl Tree {
             Threshold::Numeric(t) => {
                 let t = *t as u8;
                 for &row in indices.iter() {
-                    let bin = col[row as usize];
+                    let bin = ((packed_bins[row as usize] >> shift) & 0xFF) as u8;
                     let goes_left = if bin == sentinel { missing } else { (bin <= t) as usize };
                     left_buffer[left_count] = row;
                     right_buffer[right_count] = row;
@@ -245,7 +249,7 @@ impl Tree {
             }
             Threshold::Categorical(cats) => {
                 for &row in indices.iter() {
-                    let bin = col[row as usize] as usize;
+                    let bin = ((packed_bins[row as usize] >> shift) & 0xFF) as usize;
                     let goes_left = if bin == sentinel as usize { missing } else { cats[bin] as usize };
                     left_buffer[left_count] = row;
                     right_buffer[right_count] = row;

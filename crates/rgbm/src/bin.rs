@@ -8,95 +8,149 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand::seq::IteratorRandom;
 
+// Hardcoded so indices fit into u8.
+const MAX_NUM_BINS: usize = 256;
 
-pub enum BinnerKind {
-    /// Upper bounds for each bin. The last entry is always +inf.
-    /// A value `x` maps to bin `i` if `i` is maximal s.t. `x <= upper_bounds[i]`.
+/// Bin mapping rules. Nulls, NaNs, and unknown categories map to bin index -1 = 255.
+pub enum FeatureBinner {
+    // values are upper bounds. For 3 bins (-inf, 0), [0, inf), and missings, upper
+    // bounds would be [0.0].
     Numerical(Vec<f64>),
-    /// Maps each category string to its bin index (position in the training dictionary).
+    // Map from category strings to bin indices. Missings are not category strings but
+    // map to the sentinel bin index.
     Categorical(AHashMap<String, u8>),
 }
 
-/// Stores both the bin mapping rules and the pre-computed bin indices for the training data.
-/// Nulls, NaNs, and unknown categories map to a sentinel bin at index `num_bins()`.
-pub struct FeatureBinner {
-    pub bins: Vec<u8>,
-    pub kind: BinnerKind,
-}
-
 impl FeatureBinner {
-    /// Build a `FeatureBinner` from an Arrow array. Dispatches on array type:
-    /// Float64 -> numerical binning, Dictionary -> categorical binning.
-    pub fn from_array(array: &dyn Array, num_bins: usize, min_data_in_bin: usize) -> Self {
+    pub fn new(array: &dyn Array, min_data_in_bin: usize) -> Self {
         match array.data_type() {
             DataType::Float64 => {
-                assert!(num_bins > 0, "num_bins must be at least 1, got {num_bins}");
                 let values = array.as_primitive::<Float64Type>();
 
                 // todo: use booster's seed once we have it
+                // For very large datasets, use a subsample of the dataset to determine
+                // bin boundaries.
                 const MAX_SAMPLE: usize = 200_000;  // same as LGBM
                 let mut rng = StdRng::seed_from_u64(0);
                 let mut valid = values.iter().flatten().filter(|x| !x.is_nan())
                     .choose_multiple(&mut rng, MAX_SAMPLE);
                 valid.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
-                let upper_bounds = greedy_find_bins(&valid, num_bins, min_data_in_bin);
-                let sentinel = upper_bounds.len() as u8;
-                let raw_values = values.values();
-                let mut bins = Vec::with_capacity(raw_values.len());
-                if let Some(nulls) = values.nulls() {
-                    for (i, &x) in raw_values.iter().enumerate() {
-                        bins.push(if nulls.is_null(i) || x.is_nan() { sentinel } else { upper_bounds.partition_point(|&b| b < x) as u8 });
-                    }
-                } else {
-                    for &x in raw_values {
-                        bins.push(if x.is_nan() { sentinel } else { upper_bounds.partition_point(|&b| b < x) as u8 });
-                    }
-                }
-
-                Self { bins, kind: BinnerKind::Numerical(upper_bounds) }
+                FeatureBinner::Numerical(greedy_find_bins(&valid, min_data_in_bin))
             }
             DataType::Dictionary(_, _) => {
                 let dict = array.as_any_dictionary();
                 let dict_values = dict.values().as_string::<i32>();
 
-                // todo: implement multi-category splits (LightGBM-style 4-byte bitset per bin)
-                assert!(dict_values.len() <= num_bins, "categorical feature has {} categories, max is {num_bins}; reduce the number of categories", dict_values.len());
-
-                let mut categories_to_bins = AHashMap::new();
+                let mut categories = AHashMap::new();
+                let mut bin_idx: u8 = 0;
                 for i in 0..dict_values.len() {
+                    // missings are implicit and not part of the dict_values.
+                    // They get skipped.
                     if dict_values.is_valid(i) {
-                        categories_to_bins.insert(dict_values.value(i).to_string(), i as u8);
+                        categories.insert(dict_values.value(i).to_string(), bin_idx);
+                        bin_idx += 1;
                     }
                 }
 
-                // dict value at position i always maps to bin i (by construction above)
-                let sentinel = categories_to_bins.len() as u8;
-                let key_to_bin: Vec<u8> = (0..dict_values.len())
-                    .map(|i| if dict_values.is_valid(i) { i as u8 } else { sentinel })
-                    .collect();
-                let keys = dict.normalized_keys(); // arbitrary values for null rows
-                let bins = (0..dict.len())
-                    .map(|i| if dict.is_null(i) { sentinel } else { key_to_bin[keys[i]] })
-                    .collect();
-
-                Self { bins, kind: BinnerKind::Categorical(categories_to_bins) }
+                // todo: implement multi-category splits, either by grouping least
+                // frequent categories into "other", or some other magic.
+                // Putting the assert! after the loop makes it easier to handle the edge
+                // cases: (i) 256 categories, 1 of them missings (allowed) and (ii)
+                // 256 categories, all valid (not allowed).
+                assert!(
+                    categories.len() < MAX_NUM_BINS,
+                    "categorical feature has {} valid categories, max allowed is {}; reduce the number of categories", 
+                    categories.len(), 
+                    MAX_NUM_BINS - 1
+                );
+                FeatureBinner::Categorical(categories)
             }
             dt => panic!("unsupported feature type {dt:?}; expected Float64 or Dictionary"),
         }
     }
 
-    pub fn is_categorical(&self) -> bool {
-        matches!(self.kind, BinnerKind::Categorical(_))
-    }
+    /// Apply the binner an Arrow array, producing one bin index per row.
+    pub fn apply(&self, array: &dyn Array) -> Vec<u8> {
+        match self {
+            FeatureBinner::Numerical(upper_bounds) => {
+                let values = array.as_primitive::<Float64Type>();
+                let raw_values = values.values();
 
-    pub fn num_bins(&self) -> usize {
-        match &self.kind {
-            BinnerKind::Numerical(upper_bounds) => upper_bounds.len(),
-            BinnerKind::Categorical(cats) => cats.len(),
+                // unknown bins map past the last index. Equal to self::num_bins() - 1.
+                let sentinel = upper_bounds.len() as u8 + 1;
+                let mut binned_values = Vec::with_capacity(raw_values.len());
+
+                // Check for nulls outside the main loop to avoid branches. Nulls are
+                // stored in a separate bitmap. NaNs are specific floats. We treat both
+                // the same. The loop without nulls is much faster.
+                if let Some(nulls) = values.nulls() {
+                    for (i, &x) in raw_values.iter().enumerate() {
+                        binned_values.push(if nulls.is_null(i) || x.is_nan() { sentinel } else { upper_bounds.partition_point(|&b| b < x) as u8 });
+                    }
+                } else {
+                    for &x in raw_values {
+                        binned_values.push(if x.is_nan() { sentinel } else { upper_bounds.partition_point(|&b| b < x) as u8 });
+                    }
+                }
+                binned_values
+            }
+            FeatureBinner::Categorical(categories) => {
+                let dict = array.as_any_dictionary();
+                // Category values must be strings. todo: support other types.
+                let dict_values = dict.values().as_string::<i32>();
+                // unknown categories map to last bin index. This needs not be 255 if
+                // there are fewer than 255 categories, allowing us to use tighter bin
+                // packing in the future (todo).
+                let sentinel = categories.len() as u8;
+
+                // Build a mapping from dictionary key to bin index. Importantly,
+                // calling apply(array) on an array with different categories as the one
+                // used in new() still works.
+                let key_to_bin: Vec<u8> = dict_values
+                    .iter()
+                    .map(|opt_val| {
+                        opt_val
+                            .and_then(|val| categories.get(val).copied())
+                            .unwrap_or(sentinel)
+                    })
+                    .collect();
+
+                let keys = dict.normalized_keys(); 
+                let mut binned_values = Vec::with_capacity(dict.len());
+                
+                // Same as for numericals: Check for nulls outside the main loop.
+                if let Some(nulls) = dict.nulls() {
+                    for i in 0..dict.len() {
+                        binned_values.push(if nulls.is_null(i) { 
+                            sentinel 
+                        } else { 
+                            key_to_bin[keys[i] as usize] 
+                        });
+                    }
+                } else {
+                    for key in keys {
+                        binned_values.push(key_to_bin[key as usize]);
+                    }
+                }
+            binned_values
+            }
         }
     }
 
+    pub fn num_bins(&self) -> usize {
+        match self {
+            // For bins (-inf, 0), [0, inf), and missings -> upper_bounds = [0.0],
+            // num_bins = 3.
+            FeatureBinner::Numerical(upper_bounds) => upper_bounds.len() + 2,
+            // +1 as missings and unknown categories are implicit.
+            FeatureBinner::Categorical(cats) => cats.len() + 1,
+        }
+    }
+
+    pub fn is_categorical(&self) -> bool {
+        matches!(self, FeatureBinner::Categorical(_))
+    }
 }
 
 /// Greedy bin boundary search over sorted values.
@@ -106,30 +160,31 @@ impl FeatureBinner {
 /// (using the midpoint with the previous distinct value). This naturally isolates
 /// high-frequency values into their own bins without a pre-pass. Different logic
 /// to lgbm's more complex "is_big" heuristic, but achieves the same goal in practice.
-fn greedy_find_bins(sorted_values: &[f64], num_bins: usize, min_data_in_bin: usize) -> Vec<f64> {
+fn greedy_find_bins(sorted_values: &[f64], min_data_in_bin: usize) -> Vec<f64> {
     if sorted_values.is_empty() {
-        return vec![f64::INFINITY];
+        return vec![];
     }
 
     // Compress sorted data into (value, count) pairs. Requires sorted input.
-    let distinct: Vec<(f64, usize)> = sorted_values
+    let value_counts: Vec<(f64, usize)> = sorted_values
         .chunk_by(|a, b| a == b)
         .map(|c| (c[0], c.len()))
         .collect();
 
-    let mean_size = (sorted_values.len() as f64 / num_bins as f64).max(min_data_in_bin as f64);
+    let mean_size = (sorted_values.len() as f64 / MAX_NUM_BINS as f64).max(min_data_in_bin as f64);
     let mut bounds = Vec::new();
-    let mut current_count = 0usize;
+    let mut current_count: usize = 0;
 
-    for i in 0..distinct.len() - 1 {
-        let (val, count) = distinct[i];
+    for i in 0..value_counts.len() - 1 {
+        let (value, count) = value_counts[i];
 
-        // Overshoot guard: if adding this value would exceed mean_size, cut before it.
-        // Safe to use distinct[i - 1] because current_count > 0 implies i >= 1.
+        // Overshoot guard: if adding this value to current bin would exceed mean_size,
+        // cut before it.
+        // Safe to use value_counts[i - 1] because current_count > 0 implies i >= 1.
         if current_count > 0 && (current_count + count) as f64 >= mean_size {
-            bounds.push(((distinct[i - 1].0 + val) / 2.0).next_up());
+            bounds.push(((value_counts[i - 1].0 + value) / 2.0).next_up()); 
             current_count = 0;
-            if bounds.len() >= num_bins - 1 {
+            if bounds.len() >= MAX_NUM_BINS - 2 {
                 break;
             }
         }
@@ -138,15 +193,14 @@ fn greedy_find_bins(sorted_values: &[f64], num_bins: usize, min_data_in_bin: usi
 
         // Standard cut: accumulated bin is full, cut after this value.
         if current_count as f64 >= mean_size {
-            bounds.push(((val + distinct[i + 1].0) / 2.0).next_up());
+            bounds.push(((value + value_counts[i + 1].0) / 2.0).next_up());
             current_count = 0;
-            if bounds.len() >= num_bins - 1 {
+            if bounds.len() >= MAX_NUM_BINS - 2 {
                 break;
             }
         }
     }
 
-    bounds.push(f64::INFINITY);
     bounds
 }
 
@@ -162,25 +216,19 @@ mod tests {
 
     #[test]
     fn test_few_distinct_values() {
-        // input [1.0, 2.0, 3.0, 1.0, 2.0] → bins [0, 1, 2, 0, 1]
+        // input [1.0, 2.0, 3.0, 1.0, 2.0] → bins [0, 1, 2, 0, 1], sentinel at 3
         let arr = make_array(&[1.0, 2.0, 3.0, 1.0, 2.0]);
-        let binner = FeatureBinner::from_array(&arr, 255, 1);
-        assert_eq!(binner.num_bins(), 3);
-        assert_eq!(binner.bins, vec![0, 1, 2, 0, 1]);
-    }
-
-    #[test]
-    fn test_max_number_of_bins_limits_bins() {
-        let values: Vec<f64> = (0..100).map(|i| i as f64).collect();
-        let binner = FeatureBinner::from_array(&make_array(&values), 10, 1);
-        assert!(binner.num_bins() <= 10);
+        let binner = FeatureBinner::new(&arr, 1);
+        assert_eq!(binner.apply(&arr), vec![0, 1, 2, 0, 1]);
     }
 
     #[test]
     fn test_monotone_bin_assignment() {
         let values: Vec<f64> = (0..1000).map(|i| i as f64 * 0.1).collect();
-        let binner = FeatureBinner::from_array(&make_array(&values), 32, 1);
-        for w in binner.bins.windows(2) {
+        let arr = make_array(&values);
+        let binner = FeatureBinner::new(&arr, 1);
+        let bins = binner.apply(&arr);
+        for w in bins.windows(2) {
             assert!(w[0] <= w[1], "bins not monotone: {} > {}", w[0], w[1]);
         }
     }
@@ -188,37 +236,22 @@ mod tests {
     #[test]
     fn test_null_nan_sentinel() {
         let arr = Float64Array::from(vec![Some(1.0), None, Some(f64::NAN)]);
-        let binner = FeatureBinner::from_array(&arr, 255, 1);
-        assert_eq!(binner.bins[1], binner.num_bins() as u8);
-        assert_eq!(binner.bins[2], binner.num_bins() as u8);
-    }
-
-    #[test]
-    #[should_panic(expected = "num_bins must be at least 1")]
-    fn test_invalid_max_number_of_bins() {
-        FeatureBinner::from_array(&make_array(&[1.0, 2.0]), 0, 1);
-    }
-
-    #[test]
-    fn test_dominant_value_gets_own_bin() {
-        // [0]*5 + [1]*5 + [2]*2 + [3]*100 + [4]*8, max_bins=3 → {0,1,2} | {3} | {4}
-        let values: Vec<f64> = [(0., 5usize), (1., 5), (2., 2), (3., 100), (4., 8)]
-            .iter()
-            .flat_map(|&(v, n)| std::iter::repeat(v).take(n))
-            .collect();
-        let binner = FeatureBinner::from_array(&make_array(&values), 3, 1);
-        assert_eq!(binner.num_bins(), 3);
-        assert_eq!(binner.bins[10], 0);   // value 2.0
-        assert_eq!(binner.bins[12], 1);   // value 3.0
-        assert_eq!(binner.bins[112], 2);  // value 4.0
+        let binner = FeatureBinner::new(&arr, 1);
+        let bins = binner.apply(&arr);
+        // null and NaN map to the same sentinel bin
+        assert_eq!(bins[1], bins[2]);
+        // sentinel is below num_bins() (which counts sentinel as a bin)
+        assert!((bins[1] as usize) < binner.num_bins());
+        // valid value maps to a different bin
+        assert_ne!(bins[0], bins[1]);
     }
 
     #[test]
     fn test_min_data_in_bin_reduces_bin_count() {
         let values: Vec<f64> = (0..100).map(|i| i as f64).collect();
         let arr = make_array(&values);
-        let strict = FeatureBinner::from_array(&arr, 255, 10);
-        let loose = FeatureBinner::from_array(&arr, 255, 1);
+        let strict = FeatureBinner::new(&arr, 10);
+        let loose = FeatureBinner::new(&arr, 1);
         assert!(strict.num_bins() <= loose.num_bins());
     }
 }

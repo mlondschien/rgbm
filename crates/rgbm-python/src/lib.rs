@@ -22,7 +22,6 @@ impl GradientBooster {
         num_iterations = 100,
         learning_rate = 0.1,
         max_depth = 6,
-        min_data_in_leaf = 20,
         min_sum_hessian_in_leaf = 1e-3,
         lambda_l1 = 0.0,
         lambda_l2 = 0.0,
@@ -36,7 +35,6 @@ impl GradientBooster {
         num_iterations: usize,
         learning_rate: f64,
         max_depth: usize,
-        min_data_in_leaf: usize,
         min_sum_hessian_in_leaf: f64,
         lambda_l1: f64,
         lambda_l2: f64,
@@ -57,7 +55,7 @@ impl GradientBooster {
         Ok(Self {
             booster: Booster::new(Parameters {
                 num_iterations, learning_rate, max_depth,
-                min_data_in_leaf, min_sum_hessian_in_leaf,
+                min_sum_hessian_in_leaf,
                 lambda_l1, lambda_l2, max_bin, min_data_in_bin, max_leaves, leaf_wise,
             }, obj),
         })
@@ -67,7 +65,7 @@ impl GradientBooster {
         let batch = RecordBatch::from_pyarrow_bound(x)?;
         let labels = Float64Array::from(ArrayData::from_pyarrow_bound(y)?);
         let p = &self.booster.parameters;
-        let dataset = Dataset::from_arrow(&batch, &labels, None, p.max_bin, p.min_data_in_bin);
+        let dataset = Dataset::from_arrow(&batch, &labels, None, p.min_data_in_bin);
         py.allow_threads(|| self.booster.fit(&dataset));
         Ok(())
     }

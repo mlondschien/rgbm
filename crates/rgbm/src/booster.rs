@@ -29,19 +29,18 @@ impl Booster {
         self.base_score = self.objective.initial_score(labels);
 
         let mut scores = vec![self.base_score; dataset.num_rows];
-        let mut gradients = vec![0.0; dataset.num_rows];
-        let mut hessians = vec![0.0; dataset.num_rows];
+        let mut grad_hess = vec![[0.0f64; 2]; dataset.num_rows];
 
         self.trees.clear();
 
         for _ in 0..self.parameters.num_iterations {
-            for (((g, h), &label), &score) in gradients.iter_mut().zip(hessians.iter_mut()).zip(labels.iter()).zip(scores.iter()) {
-                *g = self.objective.gradient(label, score);
-                *h = self.objective.hessian(label, score);
+            for ((gh, &label), &score) in grad_hess.iter_mut().zip(labels.iter()).zip(scores.iter()) {
+                gh[0] = self.objective.gradient(label, score);
+                gh[1] = self.objective.hessian(label, score);
             }
 
             let mut tree = Tree::new(self.parameters.max_leaves);
-            let leaf_indices = tree.fit(dataset, &gradients, &hessians, &self.parameters);
+            let leaf_indices = tree.fit(dataset, &grad_hess, &self.parameters);
 
             for (score, &leaf_idx) in scores.iter_mut().zip(&leaf_indices) {
                 *score += tree.nodes[leaf_idx as usize].value;
@@ -89,12 +88,12 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(x))]).unwrap();
         let labels = Float64Array::from(y);
-        let dataset = Dataset::from_arrow(&batch, &labels, None, 255, 1);
+        let dataset = Dataset::from_arrow(&batch, &labels, None, 1);
         (dataset, batch)
     }
 
     fn test_params() -> Parameters {
-        Parameters { num_iterations: 20, min_data_in_leaf: 1, min_sum_hessian_in_leaf: 0.0, ..Parameters::default() }
+        Parameters { num_iterations: 20, min_sum_hessian_in_leaf: 0.0, ..Parameters::default() }
     }
 
     fn mse(preds: &Float64Array, labels: &[f64]) -> f64 {
