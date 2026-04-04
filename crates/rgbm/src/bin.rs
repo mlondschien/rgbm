@@ -12,6 +12,7 @@ use rand::seq::IteratorRandom;
 const MAX_NUM_BINS: usize = 256;
 
 /// Bin mapping rules. Nulls, NaNs, and unknown categories map to bin index -1 = 255.
+#[derive(Clone)]
 pub enum FeatureBinner {
     // values are upper bounds. For 3 bins (-inf, 0), [0, inf), and missings, upper
     // bounds would be [0.0].

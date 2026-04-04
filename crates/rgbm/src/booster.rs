@@ -1,7 +1,8 @@
-use arrow::array::{DictionaryArray, Float64Array, PrimitiveArray};
-use arrow::datatypes::{Float64Type, UInt32Type};
+use arrow::array::{Float64Array, PrimitiveArray};
+use arrow::datatypes::Float64Type;
 use arrow::record_batch::RecordBatch;
 
+use crate::bin::FeatureBinner;
 use crate::dataset::Dataset;
 use crate::parameters::Parameters;
 use crate::objective::Objective;
@@ -12,6 +13,7 @@ pub struct Booster {
     pub objective: Box<dyn Objective>,
     pub trees: Vec<Tree>,
     pub base_score: f64,
+    pub feature_binners: Vec<FeatureBinner>,
 }
 
 impl Booster {
@@ -21,10 +23,12 @@ impl Booster {
             objective,
             trees: Vec::new(),
             base_score: 0.0,
+            feature_binners: Vec::new(),
         }
     }
 
     pub fn fit(&mut self, dataset: &Dataset) {
+        self.feature_binners = dataset.feature_binners.clone();
         let labels = dataset.labels.values();
         self.base_score = self.objective.initial_score(labels);
 
@@ -53,12 +57,12 @@ impl Booster {
     pub fn predict(&self, batch: &RecordBatch) -> Float64Array {
         let num_cols = batch.num_columns();
         let mut numeric_columns: Vec<Option<&PrimitiveArray<Float64Type>>> = vec![None; num_cols];
-        let mut categorical_columns: Vec<Option<&PrimitiveArray<UInt32Type>>> = vec![None; num_cols];
+        let mut categorical_columns: Vec<Option<Vec<u8>>> = vec![None; num_cols];
         for (i, col) in batch.columns().iter().enumerate() {
             if let Some(arr) = col.as_any().downcast_ref::<PrimitiveArray<Float64Type>>() {
                 numeric_columns[i] = Some(arr);
-            } else if let Some(dict) = col.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
-                categorical_columns[i] = Some(dict.keys());
+            } else if matches!(col.data_type(), arrow::datatypes::DataType::Dictionary(_, _)) {
+                categorical_columns[i] = Some(self.feature_binners[i].apply(col.as_ref()));
             }
         }
 

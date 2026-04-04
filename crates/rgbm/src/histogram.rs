@@ -2,7 +2,6 @@
 
 use crate::dataset::FeatureBundle;
 use crate::parameters::Parameters;
-use crate::utils::calculate_score;
 
 
 #[derive(Clone, Default, Debug)]
@@ -31,12 +30,6 @@ pub struct SplitInfo {
     pub gain: f64,
     pub missing_goes_left: bool,
     pub threshold: Threshold,
-    pub left_gradient: f64,
-    pub right_gradient: f64,
-    pub left_hessian: f64,
-    pub right_hessian: f64,
-    pub left_score: f64,
-    pub right_score: f64,
 }
 
 /// Histogram for one feature over a set of rows.
@@ -126,121 +119,88 @@ impl Histogram {
         parent_score: f64,
         parameters: &Parameters,
     ) -> Option<SplitInfo> {
-        let num_bins = self.bins.len().saturating_sub(1);
-        if num_bins == 0 { return None; }
-
-        let sentinel = &self.bins[num_bins];  // bin containing missings
+        let sentinel_bin = &self.bins.last().unwrap();
 
         let mut left_gradient = 0.0;
         let mut left_hessian = 0.0;
-
-        let mut cumsum_gradients = Vec::with_capacity(num_bins);
-        let mut cumsum_hessians = Vec::with_capacity(num_bins);
-
-        // Pass 1 through the data: Compute cumulative sums.
-        for bin in &self.bins[..num_bins] {
-            left_gradient += bin.sum_gradients;
-            left_hessian += bin.sum_hessians;
-
-            cumsum_gradients.push(left_gradient);
-            cumsum_hessians.push(left_hessian);
-        }
 
         let mut best_score = f64::NEG_INFINITY;
         let mut best_threshold = 0usize;
         let mut best_missing_goes_left = false;
 
         // Code duplication: Two loops with the same gain calculation but with the
-        // branch on the outside
-        if sentinel.sum_hessians == 0.0 {
-            // Pass 2: SIMD-friendly gain calculation. The goal is to have no loop-
-            // carried dependencies so the compiler can perfectly unroll and vectorize.
-            // Stop at num_bins - 1: threshold t means bins 0..=t go left, so right
-            // must have at least one non-sentinel bin (t = num_bins - 1 is degenerate).
-            for t in 0..num_bins - 1 {
-                let left_gradient = cumsum_gradients[t];
-                let left_hessian = cumsum_hessians[t];
-                let right_hessian = total_hessian - left_hessian;
+        // branch on the outside.
+        if sentinel_bin.sum_hessians == 0.0 {
+            // If there's two bins: One sentinel and one regular and no values in the
+            // sentinel bin, there's nothing to split.
+            if self.bins.len() < 3 { return None; }
+            // Safe due to the check above.
+            for t in 0..self.bins.len() - 2 {
+                let bin = &self.bins[t];
+                left_gradient += bin.sum_gradients;
+                left_hessian += bin.sum_hessians;
+
                 let right_gradient = total_gradient - left_gradient;
-
-                // gain = score - parent_score
-                // We always compute the score, even if leaf constraints
-                // (min_sum_hessian_in_leaf) are not met. This allows the compiler to
-                // perfectly unroll without any branching issues.
-                let score = calculate_score(left_gradient, left_hessian, parameters.lambda_l1, parameters.lambda_l2) + calculate_score(right_gradient, right_hessian, parameters.lambda_l1, parameters.lambda_l2);
-
-                // Use & instead of && to avoid branching.
-                let leaf_constraint = (left_hessian >= parameters.min_sum_hessian_in_leaf) & (right_hessian >= parameters.min_sum_hessian_in_leaf);
-                let score = if leaf_constraint { score } else { f64::NEG_INFINITY };
-                if score > best_score {
-                    best_score = score;
-                    best_threshold = t;
-                    // If no missings at train time but some at test time, send missings
-                    // to the larger side of the split.
-                    best_missing_goes_left = left_hessian > right_hessian;
-                }
+                let right_hessian = total_hessian - left_hessian;
+                // Given a feature with no missing values, we still need to decide how
+                // to route missing values at predict. Heuristic: Route them to the
+                // "bigger" side.
+                let missing_goes_left = left_hessian > right_hessian;
+                
+                evaluate_split(
+                    left_gradient, left_hessian, right_gradient, right_hessian,
+                    missing_goes_left, t, parameters, 
+                    &mut best_score, &mut best_threshold, &mut best_missing_goes_left
+                );
             }
         } else {
-            for t in 0..num_bins.saturating_sub(1) {
-                // Same code as above. First compute score for missing_goes_left = false.
-                let left_gradient = cumsum_gradients[t];
-                let left_hessian = cumsum_hessians[t];
-                let right_hessian = total_hessian - left_hessian;
+            if self.bins.len() < 2 { return None; }
+            // One additional split to check compared to above: All missing values go
+            // left, everything else goes right.
+            for t in 0..self.bins.len() - 1 {
+                // first compute score for missing_goes_left = false.
+                left_gradient += self.bins[t].sum_gradients;
+                left_hessian += self.bins[t].sum_hessians;
+
                 let right_gradient = total_gradient - left_gradient;
+                let right_hessian = total_hessian - left_hessian;
 
-                let score = calculate_score(left_gradient, left_hessian, parameters.lambda_l1, parameters.lambda_l2) + calculate_score(right_gradient, right_hessian, parameters.lambda_l1, parameters.lambda_l2);
-                let leaf_constraint = (left_hessian >= parameters.min_sum_hessian_in_leaf) & (right_hessian >= parameters.min_sum_hessian_in_leaf);
-                let score = if leaf_constraint { score } else { f64::NEG_INFINITY };
+                evaluate_split(
+                    left_gradient, left_hessian, right_gradient, right_hessian,
+                    false, t, parameters, 
+                    &mut best_score, &mut best_threshold, &mut best_missing_goes_left
+                );
 
-                if score > best_score {
-                    best_score = score;
-                    best_threshold = t;
-                    best_missing_goes_left = false;
-                }
+                // now compute score for missing_goes_left = true.
+                let left_gradient_plus_sentinel = left_gradient + sentinel_bin.sum_gradients;
+                let left_hessian_plus_sentinel = left_hessian + sentinel_bin.sum_hessians;
+                let right_gradient_minus_sentinel = right_gradient - sentinel_bin.sum_gradients;
+                let right_hessian_minus_sentinel = right_hessian - sentinel_bin.sum_hessians;
 
-                // Now compute score for missing_goes_left = true.
-                // new assignments so compiler knows there's no dependencies
-                let left_hessian = left_hessian + sentinel.sum_hessians;
-                let left_gradient = left_gradient + sentinel.sum_gradients;
-                let right_hessian = right_hessian - sentinel.sum_hessians;
-                let right_gradient = right_gradient - sentinel.sum_gradients;
-
-                let score = calculate_score(left_gradient, left_hessian, parameters.lambda_l1, parameters.lambda_l2) + calculate_score(right_gradient, right_hessian, parameters.lambda_l1, parameters.lambda_l2);
-                let leaf_constraint = (left_hessian >= parameters.min_sum_hessian_in_leaf) & (right_hessian >= parameters.min_sum_hessian_in_leaf);
-                let score = if leaf_constraint { score } else { f64::NEG_INFINITY };
-
-                if score > best_score {
-                    best_score = score;
-                    best_threshold = t;
-                    best_missing_goes_left = true;
-                }
+                evaluate_split(
+                    left_gradient_plus_sentinel, left_hessian_plus_sentinel,
+                    right_gradient_minus_sentinel, right_hessian_minus_sentinel,
+                    true, t, parameters, 
+                    &mut best_score, &mut best_threshold, &mut best_missing_goes_left
+                );
             }
         }
 
         // Only ever split with positive gain.
         if best_score <= parent_score { return None; }
 
-        let left_gradient = cumsum_gradients[best_threshold]
-            + if best_missing_goes_left { sentinel.sum_gradients } else { 0.0 };
-        let left_hessian  = cumsum_hessians[best_threshold]
-            + if best_missing_goes_left { sentinel.sum_hessians } else { 0.0 };
-        let right_gradient = total_gradient - left_gradient;
-        let right_hessian  = total_hessian - left_hessian;
-
         Some(SplitInfo {
             gain: best_score - parent_score,
             missing_goes_left: best_missing_goes_left,
             threshold: Threshold::Numeric(best_threshold as u32),
-            left_gradient,
-            right_gradient,
-            left_hessian,
-            right_hessian,
-            left_score: calculate_score(left_gradient, left_hessian, parameters.lambda_l1, parameters.lambda_l2),
-            right_score: calculate_score(right_gradient, right_hessian, parameters.lambda_l1, parameters.lambda_l2),
         })
     }
 
     /// Find the best categorical split by sorting bins by gradient ratio.
+    /// 
+    /// Instead of checking all 2^num_bins subsets, we first sort categories by their
+    /// gradient/hessian ratio. Then we only need to check splits between sorted
+    /// categories. This is exact according to Fisher, W. D. (1958).
     pub fn find_best_categorical_split(
         &self,
         total_gradient: f64,
@@ -248,17 +208,11 @@ impl Histogram {
         parent_score: f64,
         parameters: &Parameters,
     ) -> Option<SplitInfo> {
-        let num_bins = self.bins.len().saturating_sub(1);
-        if num_bins == 0 { return None; }
+        let num_bins = self.bins.len();
 
-        // Instead of checking all 2^num_bins subsets, we first sort categories by their
-        // gradient/hessian ratio. Then we only need to check splits between sorted
-        // categories. This is exact according to Fisher, W. D. (1958).
-
-        // PASS 1: Filter active bins AND the sentinel bin (index == num_bins).
-        // By using `0..=num_bins`, we treat missing values as just another category.
-        let mut categorical_order: Vec<(f64, usize)> = Vec::with_capacity(num_bins + 1);
-        for k in 0..=num_bins {
+        // We treat missing values as just another category.
+        let mut categorical_order: Vec<(f64, usize)> = Vec::with_capacity(num_bins);
+        for k in 0..num_bins {
             let bin = &self.bins[k];
             if bin.sum_hessians > 0.0 {
                 let ratio = bin.sum_gradients / (bin.sum_hessians + parameters.lambda_l2);
@@ -266,82 +220,90 @@ impl Histogram {
             }
         }
 
-        if categorical_order.is_empty() { return None; }
+        if categorical_order.len() < 2 { return None; }
 
         // Sort categories to find the optimal contiguous binary partition
         categorical_order.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-        let num_active_bins = categorical_order.len();
-
-        let mut cumsum_gradients = Vec::with_capacity(num_active_bins);
-        let mut cumsum_hessians = Vec::with_capacity(num_active_bins);
-
         let mut left_gradient = 0.0;
         let mut left_hessian = 0.0;
+        let mut best_score = f64::NEG_INFINITY;
+        let mut best_threshold = 0usize;
+        let mut best_missing_goes_left = false;  // ignored
 
-        // PASS 2: Compute cumsums over the SORTED categorical order
-        for &(_, k) in &categorical_order {
-            let bin = &self.bins[k];
+        for t in 0..categorical_order.len() - 1 {
+            let bin = &self.bins[categorical_order[t].1];
             left_gradient += bin.sum_gradients;
             left_hessian += bin.sum_hessians;
 
-            cumsum_gradients.push(left_gradient);
-            cumsum_hessians.push(left_hessian);
-        }
-
-        let mut best_score = f64::NEG_INFINITY;
-        let mut best_threshold = 0usize;
-
-        // PASS 3: SIMD-friendly gain calculation.
-        for t in 0..num_active_bins.saturating_sub(1){
-            let left_gradient = cumsum_gradients[t];
-            let left_hessian = cumsum_hessians[t];
-
-            let right_hessian = total_hessian - left_hessian;
             let right_gradient = total_gradient - left_gradient;
+            let right_hessian = total_hessian - left_hessian;
 
-            let score = calculate_score(left_gradient, left_hessian, parameters.lambda_l1, parameters.lambda_l2) + calculate_score(right_gradient, right_hessian, parameters.lambda_l1, parameters.lambda_l2);
-            let leaf_constraint = (left_hessian >= parameters.min_sum_hessian_in_leaf) & (right_hessian >= parameters.min_sum_hessian_in_leaf);
-            let score = if leaf_constraint { score } else { f64::NEG_INFINITY };
-
-            if score > best_score {
-                best_score = score;
-                best_threshold = t;
-            }
+            evaluate_split(
+                left_gradient, left_hessian, right_gradient, right_hessian,
+                false, t, parameters, 
+                &mut best_score, &mut best_threshold, &mut best_missing_goes_left
+            );
         }
 
         if best_score <= parent_score { return None; }
 
-        let mut goes_left = vec![false; num_bins];
-        let mut missing_goes_left = false;
-
-        for &(_, k) in &categorical_order[..best_threshold + 1] {
-            if k == num_bins {
-                missing_goes_left = true;
+        let mut goes_left = vec![false; num_bins - 1];
+        for &(_, k) in &categorical_order[..=best_threshold] {
+            if k == num_bins - 1{
+                best_missing_goes_left = true;
             } else {
                 goes_left[k] = true;
             }
         }
 
-        let left_gradient = cumsum_gradients[best_threshold];
-        let left_hessian = cumsum_hessians[best_threshold];
-        let right_gradient = total_gradient - left_gradient;
-        let right_hessian = total_hessian - left_hessian;
-
+        // todo: Route categories with zero hessian to the side with more hessian.
         Some(SplitInfo {
             gain: best_score - parent_score,
-            missing_goes_left,
+            missing_goes_left: best_missing_goes_left,
             threshold: Threshold::Categorical(goes_left),
-            left_gradient,
-            right_gradient,
-            left_hessian,
-            right_hessian,
-            left_score: calculate_score(left_gradient, left_hessian, parameters.lambda_l1, parameters.lambda_l2),
-            right_score: calculate_score(right_gradient, right_hessian, parameters.lambda_l1, parameters.lambda_l2),
         })
     }
 }
 
+/// Score of a leaf node used for gain calculation.
+///
+/// Branchless implementation for optimal SIMD performance. See also LGBM implementation
+#[inline(always)]
+pub fn calculate_score(g: f64, h: f64, l1: f64, l2: f64) -> f64 {
+    let d = (g.abs() - l1).max(0.0);
+    d * d / (h + l2)
+}
+
+
+
+#[inline(always)]
+fn evaluate_split(
+    left_gradient: f64,
+    left_hessian: f64,
+    right_gradient: f64,
+    right_hessian: f64,
+    missing_goes_left: bool,
+    threshold_idx: usize,
+    parameters: &Parameters,
+    best_score: &mut f64,
+    best_threshold: &mut usize,
+    best_missing_goes_left: &mut bool,
+) {
+    let score = calculate_score(left_gradient, left_hessian, parameters.lambda_l1, parameters.lambda_l2) 
+              + calculate_score(right_gradient, right_hessian, parameters.lambda_l1, parameters.lambda_l2);
+
+    let leaf_constraint = (left_hessian >= parameters.min_sum_hessian_in_leaf) 
+                        & (right_hessian >= parameters.min_sum_hessian_in_leaf);
+    
+    let score = if leaf_constraint { score } else { f64::NEG_INFINITY };
+
+    if score > *best_score {
+        *best_score = score;
+        *best_threshold = threshold_idx;
+        *best_missing_goes_left = missing_goes_left;
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -407,8 +369,6 @@ mod tests {
         let split = hist.find_best_numeric_split(0.0, 30.0, 0.0, &parameters).unwrap();
         assert!(matches!(split.threshold, Threshold::Numeric(1)));
         assert_approx_eq(split.gain, 60.0);
-        assert_approx_eq(split.left_score, 20.0);
-        assert_approx_eq(split.right_score, 40.0);
         assert!(split.missing_goes_left);
     }
 
