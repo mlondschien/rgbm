@@ -72,11 +72,52 @@ impl Histogram {
         let p2 = h2.as_mut_ptr();
         let p3 = h3.as_mut_ptr();
 
-        for &row in row_indices {
-            let row = row as usize;
+        // Use chunks_exact to guarantee chunk size and avoid bounds checks
+        let mut chunks = row_indices.chunks_exact(2);
+
+        for chunk in &mut chunks {
+            let r0 = chunk[0] as usize;
+            let r1 = chunk[1] as usize;
             unsafe {
-                let gh = *grad_hess.get_unchecked(row);
-                let packed = *bundle.packed_bins.get_unchecked(row);
+                let gh0 = *grad_hess.get_unchecked(r0);
+                let gh1 = *grad_hess.get_unchecked(r1);
+
+                let packed0 = *bundle.packed_bins.get_unchecked(r0);
+                let packed1 = *bundle.packed_bins.get_unchecked(r1);
+
+                // 2. Unpack bins for Row 0
+                let b0_0 = (packed0 & 0xFF) as usize;
+                let b1_0 = ((packed0 >> 8) & 0xFF) as usize;
+                let b2_0 = ((packed0 >> 16) & 0xFF) as usize;
+                let b3_0 = (packed0 >> 24) as usize;
+
+                // 3. Unpack bins for Row 1
+                let b0_1 = (packed1 & 0xFF) as usize;
+                let b1_1 = ((packed1 >> 8) & 0xFF) as usize;
+                let b2_1 = ((packed1 >> 16) & 0xFF) as usize;
+                let b3_1 = (packed1 >> 24) as usize;
+
+                // 4. Interleaved stores (maximize ALU usage and pipelining)
+                (*p0.add(b0_0)).add(gh0);
+                (*p0.add(b0_1)).add(gh1);
+
+                (*p1.add(b1_0)).add(gh0);
+                (*p1.add(b1_1)).add(gh1);
+
+                (*p2.add(b2_0)).add(gh0);
+                (*p2.add(b2_1)).add(gh1);
+
+                (*p3.add(b3_0)).add(gh0);
+                (*p3.add(b3_1)).add(gh1);
+            }
+        }
+
+        // 5. Clean up the remaining row if the length was odd
+        for &row in chunks.remainder() {
+            let r = row as usize;
+            unsafe {
+                let gh = *grad_hess.get_unchecked(r);
+                let packed = *bundle.packed_bins.get_unchecked(r);
 
                 let b0 = (packed & 0xFF) as usize;
                 let b1 = ((packed >> 8) & 0xFF) as usize;
