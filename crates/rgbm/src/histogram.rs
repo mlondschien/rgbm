@@ -30,6 +30,7 @@ pub struct SplitInfo {
     pub gain: f64,
     pub missing_goes_left: bool,
     pub threshold: Threshold,
+    pub feature_index: usize,
 }
 
 /// Histogram for one feature over a set of rows.
@@ -53,7 +54,7 @@ impl Histogram {
 
     /// Build histograms for all features in a bundle in one pass over row_indices.
     /// One 32-bit load per row replaces up to 4 separate byte loads.
-    /// SAFETY: bin values are in 0..num_bins[i] (sentinel is at num_bins[i] - 1),
+    /// SAFETY: bin values are in 0..num_bins[i] (sentinel is at index num_bins[i] - 1),
     /// histograms are sized num_bins[i].
     pub fn build(bundle: &FeatureBundle, grad_hess: &[[f64; 2]], row_indices: &[u32]) -> Vec<Self> {
         // unwrap_or(1) for the case where the bundle has fewer than 4 features.
@@ -72,47 +73,45 @@ impl Histogram {
         let p2 = h2.as_mut_ptr();
         let p3 = h3.as_mut_ptr();
 
-        // Use chunks_exact to guarantee chunk size and avoid bounds checks
+        // Use chunks_exact to guarantee chunk size and avoid bounds checks. We handle
+        // the possible leftover chunk below.
+        // with 2x unrolling and 4 features per chunk, data/pointers in one loop fit
+        // comfortably into modern CPU registers.
         let mut chunks = row_indices.chunks_exact(2);
 
         for chunk in &mut chunks {
-            let r0 = chunk[0] as usize;
-            let r1 = chunk[1] as usize;
+            let row0 = chunk[0] as usize;
+            let row1 = chunk[1] as usize;
             unsafe {
-                let gh0 = *grad_hess.get_unchecked(r0);
-                let gh1 = *grad_hess.get_unchecked(r1);
+                let gh0 = *grad_hess.get_unchecked(row0);
+                let gh1 = *grad_hess.get_unchecked(row1);   
+                let packed0 = *bundle.packed_bins.get_unchecked(row0);
+                let packed1 = *bundle.packed_bins.get_unchecked(row1);
 
-                let packed0 = *bundle.packed_bins.get_unchecked(r0);
-                let packed1 = *bundle.packed_bins.get_unchecked(r1);
+                let bin0_0 = (packed0 & 0xFF) as usize;
+                let bin1_0 = ((packed0 >> 8) & 0xFF) as usize;
+                let bin2_0 = ((packed0 >> 16) & 0xFF) as usize;
+                let bin3_0 = (packed0 >> 24) as usize;
 
-                // 2. Unpack bins for Row 0
-                let b0_0 = (packed0 & 0xFF) as usize;
-                let b1_0 = ((packed0 >> 8) & 0xFF) as usize;
-                let b2_0 = ((packed0 >> 16) & 0xFF) as usize;
-                let b3_0 = (packed0 >> 24) as usize;
+                let bin0_1 = (packed1 & 0xFF) as usize;
+                let bin1_1 = ((packed1 >> 8) & 0xFF) as usize;
+                let bin2_1 = ((packed1 >> 16) & 0xFF) as usize;
+                let bin3_1 = (packed1 >> 24) as usize;
 
-                // 3. Unpack bins for Row 1
-                let b0_1 = (packed1 & 0xFF) as usize;
-                let b1_1 = ((packed1 >> 8) & 0xFF) as usize;
-                let b2_1 = ((packed1 >> 16) & 0xFF) as usize;
-                let b3_1 = (packed1 >> 24) as usize;
+                (*p0.add(bin0_0)).add(gh0);
+                (*p0.add(bin0_1)).add(gh1);
 
-                // 4. Interleaved stores (maximize ALU usage and pipelining)
-                (*p0.add(b0_0)).add(gh0);
-                (*p0.add(b0_1)).add(gh1);
+                (*p1.add(bin1_0)).add(gh0);
+                (*p1.add(bin1_1)).add(gh1);
 
-                (*p1.add(b1_0)).add(gh0);
-                (*p1.add(b1_1)).add(gh1);
-
-                (*p2.add(b2_0)).add(gh0);
-                (*p2.add(b2_1)).add(gh1);
-
-                (*p3.add(b3_0)).add(gh0);
-                (*p3.add(b3_1)).add(gh1);
+                (*p2.add(bin2_0)).add(gh0);
+                (*p2.add(bin2_1)).add(gh1);
+                (*p3.add(bin3_0)).add(gh0);
+                (*p3.add(bin3_1)).add(gh1);
             }
         }
 
-        // 5. Clean up the remaining row if the length was odd
+        // clean up the remaining row if the length was odd
         for &row in chunks.remainder() {
             let r = row as usize;
             unsafe {
@@ -234,6 +233,7 @@ impl Histogram {
             gain: best_score - parent_score,
             missing_goes_left: best_missing_goes_left,
             threshold: Threshold::Numeric(best_threshold as u32),
+            feature_index: 0, // to be filled in by caller
         })
     }
 
@@ -303,6 +303,7 @@ impl Histogram {
             gain: best_score - parent_score,
             missing_goes_left: best_missing_goes_left,
             threshold: Threshold::Categorical(goes_left),
+            feature_index: 0, // to be filled in by caller
         })
     }
 }

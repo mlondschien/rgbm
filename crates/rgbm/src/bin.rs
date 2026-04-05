@@ -9,7 +9,7 @@ use rand::SeedableRng;
 use rand::seq::IteratorRandom;
 
 // Hardcoded so indices fit into u8.
-const MAX_NUM_BINS: usize = 256;
+const MAX_NUM_BINS: usize = 255;
 
 /// Bin mapping rules. Nulls, NaNs, and unknown categories map to bin index -1 = 255.
 #[derive(Clone)]

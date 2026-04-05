@@ -13,6 +13,23 @@ pub enum FinalThreshold {
     Categorical(Vec<bool>),
 }
 
+impl FinalThreshold {
+    pub fn from_threshold(threshold: &Threshold, binner: &FeatureBinner) -> Self {
+        match threshold {
+            Threshold::Numeric(bin) => FinalThreshold::Numeric(match binner {
+                FeatureBinner::Numerical(upper_bounds) => upper_bounds[*bin as usize],
+                FeatureBinner::Categorical(_) => panic!("numeric split on categorical feature"),
+            }),
+            Threshold::Categorical(gl) => FinalThreshold::Categorical(gl.clone()),
+        }
+    }
+}
+
+/// Node in the decision tree, stored after training.
+// why not use an enum: Leaf/Internal? I did this initially, but was told off by an LLM.
+// Apparently this way storing both leaf and internal fields together with an is_leaf
+// flag makes the predict much faster.
+#[derive(Clone)]
 pub struct Node {
     pub is_leaf: bool,
     pub left_child: usize,
@@ -21,24 +38,20 @@ pub struct Node {
     pub threshold: FinalThreshold,
     pub missing_goes_left: bool,
     pub value: f64,
-    // Training state — only meaningful for leaf nodes during Tree::fit.
-    start: usize,
-    len: usize,
-    histograms: Vec<Histogram>,
-    best_split: Option<(usize, SplitInfo)>,
-    depth: usize,
 }
 
-impl Clone for Node {
-    fn clone(&self) -> Self {
-        Node {
-            is_leaf: self.is_leaf, left_child: self.left_child, right_child: self.right_child,
-            split_feature: self.split_feature, threshold: self.threshold.clone(),
-            missing_goes_left: self.missing_goes_left, value: self.value,
-            start: 0, len: 0, histograms: Vec::new(), best_split: None, depth: 0,
-        }
-    }
+/// Leaf node during training. In leaf-first growth, we keep track of active leaves and
+/// select the next leaf to split based on the best split gain.
+pub struct ActiveLeaf {
+    leaf_index: usize,
+    start: usize,
+    len: usize,
+    depth: usize,
+    histograms: Vec<Histogram>,
+    best_split: SplitInfo,
 }
+
+
 
 fn find_best_split(
     p: &Parameters,
@@ -47,16 +60,24 @@ fn find_best_split(
     total_hessian: f64,
     parent_score: f64,
     depth: usize,
-) -> Option<(usize, SplitInfo)> {
+) -> Option<SplitInfo> {
     if depth >= p.max_depth || total_hessian < p.min_sum_hessian_in_leaf * 2.0 {
         return None;
     }
-    (0..histograms.len())
-        .filter_map(|f| {
-            histograms[f].find_best_split(total_gradient, total_hessian, parent_score, p)
-                .map(|s| (f, s))
-        })
-        .max_by(|a, b| a.1.gain.partial_cmp(&b.1.gain).unwrap())
+
+    let mut best_split: Option<SplitInfo> = None;
+
+    for f in 0..histograms.len() {
+        if let Some(mut split) = histograms[f].find_best_split(total_gradient, total_hessian, parent_score, p) {
+            split.feature_index = f;
+
+            if best_split.as_ref().map_or(true, |best| split.gain > best.gain) {
+                best_split = Some(split);
+            }
+        }
+    }
+
+    best_split
 }
 
 #[derive(Clone)]
@@ -75,98 +96,68 @@ impl Tree {
         let mut left_buffer = vec![0u32; dataset.num_rows];
         let mut right_buffer = vec![0u32; dataset.num_rows];
         let mut all_indices: Vec<u32> = (0..dataset.num_rows as u32).collect();
+        let mut active_leafs: Vec<ActiveLeaf> = Vec::new();
 
-        // 1. Seed the Root Node exactly once
-        let (total_grad, total_hess) = grad_hess.iter().fold((0.0, 0.0), |(g, h), gh| (g + gh[0], h + gh[1]));
-        let root_hists = Self::build_histograms(dataset, grad_hess, &all_indices);
-        let root = self.evaluate_and_add_node(total_grad, total_hess, 0, dataset.num_rows, root_hists, 0, p);
-
-        let mut leaves = vec![root];
+        let root_histograms = Self::build_histograms(dataset, grad_hess, &all_indices);
+        self.push_leaf(&mut active_leafs, &mut leaf_indices, &all_indices, root_histograms, 0, dataset.num_rows, 0, p);
         let mut num_leaves = 1;
 
-        // 2. Leaf-Wise Growth Loop
-        while num_leaves < p.max_leaves {
-            let best_i = match leaves.iter().enumerate()
-                .filter_map(|(i, &ni)| self.nodes[ni].best_split.as_ref().map(|(_, s)| (i, s.gain)))
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            {
-                Some((i, _)) => i,
-                None => break,
-            };
+        while num_leaves < p.max_leaves && !active_leafs.is_empty() {
+            let (idx, _) = active_leafs.iter().enumerate().max_by(|(_, a), (_, b)| {
+                a.best_split.gain.total_cmp(&b.best_split.gain)
+            }).unwrap();
+            let leaf = active_leafs.swap_remove(idx);
 
-            let node_idx = leaves.swap_remove(best_i);
-            let start = self.nodes[node_idx].start;
-            let len = self.nodes[node_idx].len;
-            let depth = self.nodes[node_idx].depth;
-            let parent_hists = std::mem::take(&mut self.nodes[node_idx].histograms);
-            let (best_f, split) = std::mem::take(&mut self.nodes[node_idx].best_split).unwrap();
+            let split_position = self.partition_indices(
+                dataset, &mut all_indices[leaf.start..leaf.start + leaf.len], &leaf.best_split, &mut left_buffer, &mut right_buffer);
 
-            let slice = &mut all_indices[start..start + len];
-            let split_pos = self.partition_indices(dataset, slice, best_f, &split, &mut left_buffer, &mut right_buffer);
+            let left_start = leaf.start;
+            let left_len = split_position;
+            let right_start = leaf.start + split_position;
+            let right_len = leaf.len - split_position;
 
-            let left_start = start;
-            let left_len = split_pos;
-            let right_start = start + split_pos;
-            let right_len = len - split_pos;
-
-            // 3. Build Histograms (Compute the smaller, subtract the larger)
-            
-            let (left_hists, right_hists);
+            // Build the smaller child directly, derive the larger by subtracting
+            let (left_histograms, right_histograms);
             if left_len < right_len {
-                left_hists = Self::build_histograms(dataset, grad_hess, &all_indices[left_start..left_start + left_len]);
-                right_hists = Self::subtract_histograms(dataset.num_features, &parent_hists, &left_hists);
+                left_histograms = Self::build_histograms(dataset, grad_hess, &all_indices[left_start..left_start + left_len]);
+                right_histograms = Self::subtract_histograms(dataset.num_features, &leaf.histograms, &left_histograms);
             } else {
-                right_hists = Self::build_histograms(dataset, grad_hess, &all_indices[right_start..right_start + right_len]);
-                left_hists = Self::subtract_histograms(dataset.num_features, &parent_hists, &right_hists);
+                right_histograms = Self::build_histograms(dataset, grad_hess, &all_indices[right_start..right_start + right_len]);
+                left_histograms = Self::subtract_histograms(dataset.num_features, &leaf.histograms, &right_histograms);
             }
 
-            // 4. Extract total child gradients from index 0 dynamically
-            let (lg, lh) = left_hists[0].bins.iter().fold((0.0, 0.0), |(g, h), b| (g + b.sum_gradients, h + b.sum_hessians));
-            let left_node = self.evaluate_and_add_node(lg, lh, left_start, left_len, left_hists, depth + 1, p);
+            let left_node_idx = self.push_leaf(&mut active_leafs, &mut leaf_indices, &all_indices, left_histograms, left_start, left_len, leaf.depth + 1, p);
+            let right_node_idx = self.push_leaf(&mut active_leafs, &mut leaf_indices, &all_indices, right_histograms, right_start, right_len, leaf.depth + 1, p);
 
-            let (rg, rh) = right_hists[0].bins.iter().fold((0.0, 0.0), |(g, h), b| (g + b.sum_gradients, h + b.sum_hessians));
-            let right_node = self.evaluate_and_add_node(rg, rh, right_start, right_len, right_hists, depth + 1, p);
-
-            let threshold = match &split.threshold {
-                Threshold::Numeric(bin) => FinalThreshold::Numeric(match &dataset.feature_binners[best_f] {
-                    FeatureBinner::Numerical(upper_bounds) => upper_bounds[*bin as usize],
-                    FeatureBinner::Categorical(_) => panic!("numeric split on categorical feature"),
-                }),
-                Threshold::Categorical(gl) => FinalThreshold::Categorical(gl.clone()),
-            };
-
-            // 5. Update Parent
-            self.nodes[node_idx].is_leaf = false;
-            self.nodes[node_idx].left_child = left_node;
-            self.nodes[node_idx].right_child = right_node;
-            self.nodes[node_idx].split_feature = best_f;
-            self.nodes[node_idx].threshold = threshold;
-            self.nodes[node_idx].missing_goes_left = split.missing_goes_left;
-            self.nodes[node_idx].value = 0.0;
-
-            leaves.push(left_node);
-            leaves.push(right_node);
+            let parent = &mut self.nodes[leaf.leaf_index];
+            parent.is_leaf = false;
+            parent.left_child = left_node_idx;
+            parent.right_child = right_node_idx;
+            parent.split_feature = leaf.best_split.feature_index;
+            parent.missing_goes_left = leaf.best_split.missing_goes_left;
+            parent.threshold = FinalThreshold::from_threshold(
+                &leaf.best_split.threshold,
+                &dataset.feature_binners[leaf.best_split.feature_index],
+            );
             num_leaves += 1;
         }
 
-        for &ni in &leaves {
-            let node = &self.nodes[ni];
-            for &row in &all_indices[node.start..node.start + node.len] {
-                leaf_indices[row as usize] = ni as u32;
+        for leaf in active_leafs {
+            for &row in &all_indices[leaf.start..leaf.start + leaf.len] {
+                leaf_indices[row as usize] = leaf.leaf_index as u32;
             }
         }
 
         leaf_indices
     }
 
-    /// Zero-allocation, lock-free evaluation of a single row.
-    /// Columns are pre-extracted in `Booster::predict` to avoid repeated downcasting.
+    /// Zero-allocation, lock-free evaluation of a single row. For speed.
     #[inline(always)]
     pub fn predict_row(
         &self,
         row: usize,
         numeric_columns: &[Option<&PrimitiveArray<Float64Type>>],
-        categorical_columns: &[Option<Vec<u8>>], // UPDATED to map correctly via binner
+        categorical_columns: &[Option<Vec<u8>>],
     ) -> f64 {
         let mut idx = 0;
         loop {
@@ -184,7 +175,6 @@ impl Tree {
                     }
                 }
                 FinalThreshold::Categorical(gl) => {
-                    // Safe mapping directly to the u8 dense array outputted by FeatureBinner
                     let col = categorical_columns[node.split_feature].as_ref().unwrap();
                     let bin = col[row] as usize;
                     if bin < gl.len() { gl[bin] } else { node.missing_goes_left }
@@ -195,7 +185,38 @@ impl Tree {
         }
     }
 
-    // --- DRY HELPERS ---
+    fn push_leaf(
+        &mut self,
+        active_leafs: &mut Vec<ActiveLeaf>,
+        leaf_indices: &mut Vec<u32>,
+        all_indices: &[u32],
+        histograms: Vec<Histogram>,
+        start: usize,
+        len: usize,
+        depth: usize,
+        p: &Parameters,
+    ) -> usize {
+        // todo: This will panic if there's no features.
+        let (gradient, hessian) = histograms[0].bins.iter()
+            .fold((0.0, 0.0), |(g, h), b| (g + b.sum_gradients, h + b.sum_hessians));
+        let score = calculate_score(gradient, hessian, p.lambda_l1, p.lambda_l2);
+        let value =calculate_value(gradient, hessian, p.lambda_l1, p.lambda_l2) * p.learning_rate;
+        let node_idx = self.nodes.len();
+        self.nodes.push(Node {
+            is_leaf: true, left_child: 0, right_child: 0, split_feature: 0,
+            threshold: FinalThreshold::Numeric(0.0), missing_goes_left: false,
+            value: value,
+        });
+        match find_best_split(p, &histograms, gradient, hessian, score, depth) {
+            Some(best_split) => active_leafs.push(ActiveLeaf { leaf_index: node_idx, start, len, depth, histograms, best_split }),
+            None => {
+                for &row in &all_indices[start..start + len] {
+                    leaf_indices[row as usize] = node_idx as u32;
+                }
+            }
+        }
+        node_idx
+    }
 
     fn build_histograms(dataset: &Dataset, grad_hess: &[[f64; 2]], indices: &[u32]) -> Vec<Histogram> {
         let mut hists = Vec::with_capacity(dataset.num_features);
@@ -213,45 +234,12 @@ impl Tree {
         }).collect()
     }
 
-    fn evaluate_and_add_node(
-        &mut self,
-        grad: f64,
-        hess: f64,
-        start: usize,
-        len: usize,
-        histograms: Vec<Histogram>,
-        depth: usize,
-        p: &Parameters,
-    ) -> usize {
-        let score = calculate_score(grad, hess, p.lambda_l1, p.lambda_l2);
-        let weight = calculate_weight(grad, hess, p.lambda_l1, p.lambda_l2);
-        let best_split = find_best_split(p, &histograms, grad, hess, score, depth);
-
-        let idx = self.nodes.len();
-        self.nodes.push(Node {
-            is_leaf: true, 
-            left_child: 0, 
-            right_child: 0, 
-            split_feature: 0,
-            threshold: FinalThreshold::Numeric(0.0), 
-            missing_goes_left: false,
-            value: weight * p.learning_rate,
-            start, 
-            len, 
-            histograms, 
-            best_split, 
-            depth,
-        });
-        idx
-    }
-
-    fn partition_indices(&self, dataset: &Dataset, indices: &mut [u32], feature: usize, split: &SplitInfo, left_buffer: &mut [u32], right_buffer: &mut [u32]) -> usize {
-        let bundle_idx = feature / 4;
-        let shift = (feature % 4) * 8;
+    fn partition_indices(&self, dataset: &Dataset, indices: &mut [u32], split: &SplitInfo, left_buffer: &mut [u32], right_buffer: &mut [u32]) -> usize {
+        let bundle_idx = split.feature_index / 4;
+        let shift = (split.feature_index % 4) * 8;
         let packed_bins = &dataset.feature_bundles[bundle_idx].packed_bins;
         
-        // FIX: The sentinel index is num_bins() - 1
-        let sentinel = (dataset.feature_binners[feature].num_bins() - 1) as u8;
+        let sentinel = (dataset.feature_binners[split.feature_index].num_bins() - 1) as u8;
         
         let missing = split.missing_goes_left as usize;
         let mut left_count = 0usize;
@@ -288,7 +276,7 @@ impl Tree {
 }
 
 #[inline(always)]
-pub fn calculate_weight(g: f64, h: f64, l1: f64, l2: f64) -> f64 {
+pub fn calculate_value(g: f64, h: f64, l1: f64, l2: f64) -> f64 {
     let d = (g.abs() - l1).max(0.0);
     -g.signum() * d / (h + l2)
 }
@@ -301,14 +289,12 @@ mod tests {
 
     fn leaf(value: f64) -> Node {
         Node { is_leaf: true, left_child: 0, right_child: 0, split_feature: 0,
-            threshold: FinalThreshold::Numeric(0.0), missing_goes_left: false, value,
-            start: 0, len: 0, histograms: Vec::new(), best_split: None, depth: 0 }
+            threshold: FinalThreshold::Numeric(0.0), missing_goes_left: false, value }
     }
 
     fn numeric_split(feature: usize, threshold: f64, left_child: usize, right_child: usize, missing_goes_left: bool) -> Node {
         Node { is_leaf: false, left_child, right_child, split_feature: feature,
-            threshold: FinalThreshold::Numeric(threshold), missing_goes_left, value: 0.0,
-            start: 0, len: 0, histograms: Vec::new(), best_split: None, depth: 0 }
+            threshold: FinalThreshold::Numeric(threshold), missing_goes_left, value: 0.0 }
     }
 
     fn predict(tree: &Tree, numeric: &[Option<Float64Array>], categorical: &[Option<Vec<u8>>], row: usize) -> f64 {
@@ -349,8 +335,7 @@ mod tests {
         let tree = Tree { nodes: vec![
             Node { is_leaf: false, left_child: 1, right_child: 2, split_feature: 0,
                 threshold: FinalThreshold::Categorical(vec![true, false, true]),
-                missing_goes_left: false, value: 0.0,
-                start: 0, len: 0, histograms: Vec::new(), best_split: None, depth: 0 },
+                missing_goes_left: false, value: 0.0 },
             leaf(-1.0),
             leaf(1.0),
         ]};
