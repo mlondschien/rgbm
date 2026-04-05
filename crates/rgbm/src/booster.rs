@@ -38,10 +38,7 @@ impl Booster {
         self.trees.clear();
 
         for _ in 0..self.parameters.num_iterations {
-            for ((gh, &label), &score) in grad_hess.iter_mut().zip(labels.iter()).zip(scores.iter()) {
-                gh[0] = self.objective.gradient(label, score);
-                gh[1] = self.objective.hessian(label, score);
-            }
+            self.objective.gradient_hessian(labels, &scores, &mut grad_hess);
 
             let mut tree = Tree::new(self.parameters.max_leaves);
             let leaf_indices = tree.fit(dataset, &grad_hess, &self.parameters);
@@ -92,7 +89,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(x))]).unwrap();
         let labels = Float64Array::from(y);
-        let dataset = Dataset::from_arrow(&batch, &labels, None, 1);
+        let dataset = Dataset::from_arrow(&batch, &labels, None, 255, 1);
         (dataset, batch)
     }
 

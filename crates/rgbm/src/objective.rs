@@ -4,6 +4,13 @@ pub trait Objective: Send + Sync {
     fn hessian(&self, label: f64, score: f64) -> f64;
     fn initial_score(&self, labels: &[f64]) -> f64;
     fn prediction(&self, score: f64) -> f64;
+
+    fn gradient_hessian(&self, labels: &[f64], scores: &[f64], out: &mut [[f64; 2]]) {
+        for ((gh, &label), &score) in out.iter_mut().zip(labels).zip(scores) {
+            gh[0] = self.gradient(label, score);
+            gh[1] = self.hessian(label, score);
+        }
+    }
 }
 
 pub struct SquaredLoss;
@@ -37,6 +44,14 @@ impl Objective for BinaryLogloss {
     fn hessian(&self, _label: f64, score: f64) -> f64 {
         let p = self.prediction(score);
         (p * (1.0 - p)).max(1e-16)
+    }
+
+    fn gradient_hessian(&self, labels: &[f64], scores: &[f64], out: &mut [[f64; 2]]) {
+        for ((gh, &label), &score) in out.iter_mut().zip(labels).zip(scores) {
+            let p = self.prediction(score);
+            gh[0] = p - label;
+            gh[1] = (p * (1.0 - p)).max(1e-16);
+        }
     }
 
     fn initial_score(&self, labels: &[f64]) -> f64 {
@@ -74,6 +89,16 @@ impl Objective for Probit {
         let p = Self::norm_cdf(score).clamp(1e-7, 1.0 - 1e-7);
         let phi = Self::norm_pdf(score);
         (phi * phi / (p * (1.0 - p))).max(1e-16)
+    }
+
+    fn gradient_hessian(&self, labels: &[f64], scores: &[f64], out: &mut [[f64; 2]]) {
+        for ((gh, &label), &score) in out.iter_mut().zip(labels).zip(scores) {
+            let p = Self::norm_cdf(score).clamp(1e-7, 1.0 - 1e-7);
+            let phi = Self::norm_pdf(score);
+            let v = p * (1.0 - p);
+            gh[0] = phi * (p - label) / v;
+            gh[1] = (phi * phi / v).max(1e-16);
+        }
     }
 
     /// Inverse cdf not implemented in libm. Possibly todo via newton's method.

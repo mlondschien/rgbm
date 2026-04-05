@@ -23,7 +23,8 @@ pub enum FeatureBinner {
 }
 
 impl FeatureBinner {
-    pub fn new(array: &dyn Array, min_data_in_bin: usize) -> Self {
+    pub fn new(array: &dyn Array, max_bin: usize, min_data_in_bin: usize) -> Self {
+        assert!(max_bin <= MAX_NUM_BINS, "max_bin {max_bin} exceeds maximum of {MAX_NUM_BINS}");
         match array.data_type() {
             DataType::Float64 => {
                 let values = array.as_primitive::<Float64Type>();
@@ -37,7 +38,7 @@ impl FeatureBinner {
                     .choose_multiple(&mut rng, MAX_SAMPLE);
                 valid.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
-                FeatureBinner::Numerical(greedy_find_bins(&valid, min_data_in_bin))
+                FeatureBinner::Numerical(greedy_find_bins(&valid, max_bin, min_data_in_bin))
             }
             DataType::Dictionary(_, _) => {
                 let dict = array.as_any_dictionary();
@@ -60,10 +61,10 @@ impl FeatureBinner {
                 // cases: (i) 256 categories, 1 of them missings (allowed) and (ii)
                 // 256 categories, all valid (not allowed).
                 assert!(
-                    categories.len() < MAX_NUM_BINS,
-                    "categorical feature has {} valid categories, max allowed is {}; reduce the number of categories", 
-                    categories.len(), 
-                    MAX_NUM_BINS - 1
+                    categories.len() < max_bin,
+                    "categorical feature has {} valid categories, max allowed is {}; reduce the number of categories",
+                    categories.len(),
+                    max_bin - 1
                 );
                 FeatureBinner::Categorical(categories)
             }
@@ -161,7 +162,7 @@ impl FeatureBinner {
 /// (using the midpoint with the previous distinct value). This naturally isolates
 /// high-frequency values into their own bins without a pre-pass. Different logic
 /// to lgbm's more complex "is_big" heuristic, but achieves the same goal in practice.
-fn greedy_find_bins(sorted_values: &[f64], min_data_in_bin: usize) -> Vec<f64> {
+fn greedy_find_bins(sorted_values: &[f64], max_bin: usize, min_data_in_bin: usize) -> Vec<f64> {
     if sorted_values.is_empty() {
         return vec![];
     }
@@ -172,7 +173,7 @@ fn greedy_find_bins(sorted_values: &[f64], min_data_in_bin: usize) -> Vec<f64> {
         .map(|c| (c[0], c.len()))
         .collect();
 
-    let mean_size = (sorted_values.len() as f64 / MAX_NUM_BINS as f64).max(min_data_in_bin as f64);
+    let mean_size = (sorted_values.len() as f64 / max_bin as f64).max(min_data_in_bin as f64);
     let mut bounds = Vec::new();
     let mut current_count: usize = 0;
 
@@ -183,9 +184,9 @@ fn greedy_find_bins(sorted_values: &[f64], min_data_in_bin: usize) -> Vec<f64> {
         // cut before it.
         // Safe to use value_counts[i - 1] because current_count > 0 implies i >= 1.
         if current_count > 0 && (current_count + count) as f64 >= mean_size {
-            bounds.push(((value_counts[i - 1].0 + value) / 2.0).next_up()); 
+            bounds.push(((value_counts[i - 1].0 + value) / 2.0).next_up());
             current_count = 0;
-            if bounds.len() >= MAX_NUM_BINS - 2 {
+            if bounds.len() >= max_bin - 1 {
                 break;
             }
         }
@@ -196,7 +197,7 @@ fn greedy_find_bins(sorted_values: &[f64], min_data_in_bin: usize) -> Vec<f64> {
         if current_count as f64 >= mean_size {
             bounds.push(((value + value_counts[i + 1].0) / 2.0).next_up());
             current_count = 0;
-            if bounds.len() >= MAX_NUM_BINS - 2 {
+            if bounds.len() >= max_bin - 1 {
                 break;
             }
         }
@@ -219,7 +220,7 @@ mod tests {
     fn test_few_distinct_values() {
         // input [1.0, 2.0, 3.0, 1.0, 2.0] → bins [0, 1, 2, 0, 1], sentinel at 3
         let arr = make_array(&[1.0, 2.0, 3.0, 1.0, 2.0]);
-        let binner = FeatureBinner::new(&arr, 1);
+        let binner = FeatureBinner::new(&arr, 255, 1);
         assert_eq!(binner.apply(&arr), vec![0, 1, 2, 0, 1]);
     }
 
@@ -227,7 +228,7 @@ mod tests {
     fn test_monotone_bin_assignment() {
         let values: Vec<f64> = (0..1000).map(|i| i as f64 * 0.1).collect();
         let arr = make_array(&values);
-        let binner = FeatureBinner::new(&arr, 1);
+        let binner = FeatureBinner::new(&arr, 255, 1);
         let bins = binner.apply(&arr);
         for w in bins.windows(2) {
             assert!(w[0] <= w[1], "bins not monotone: {} > {}", w[0], w[1]);
@@ -237,7 +238,7 @@ mod tests {
     #[test]
     fn test_null_nan_sentinel() {
         let arr = Float64Array::from(vec![Some(1.0), None, Some(f64::NAN)]);
-        let binner = FeatureBinner::new(&arr, 1);
+        let binner = FeatureBinner::new(&arr, 255, 1);
         let bins = binner.apply(&arr);
         // null and NaN map to the same sentinel bin
         assert_eq!(bins[1], bins[2]);
@@ -251,8 +252,8 @@ mod tests {
     fn test_min_data_in_bin_reduces_bin_count() {
         let values: Vec<f64> = (0..100).map(|i| i as f64).collect();
         let arr = make_array(&values);
-        let strict = FeatureBinner::new(&arr, 10);
-        let loose = FeatureBinner::new(&arr, 1);
+        let strict = FeatureBinner::new(&arr, 255, 10);
+        let loose = FeatureBinner::new(&arr, 255, 1);
         assert!(strict.num_bins() <= loose.num_bins());
     }
 }

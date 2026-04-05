@@ -47,6 +47,7 @@ impl Dataset {
         features: &RecordBatch,
         labels: &Float64Array,
         weights: Option<&Float64Array>,
+        max_bin: usize,
         min_data_in_bin: usize,
     ) -> Self {
         let num_features = features.num_columns();
@@ -56,7 +57,7 @@ impl Dataset {
 
         for (field, array) in features.schema().fields().iter().zip(features.columns()) {
             feature_names.push(field.name().clone());
-            let binner = FeatureBinner::new(array.as_ref(), min_data_in_bin);
+            let binner = FeatureBinner::new(array.as_ref(), max_bin, min_data_in_bin);
             all_bins.push(binner.apply(array.as_ref()));
             feature_binners.push(binner);
         }
@@ -105,7 +106,7 @@ mod tests {
     #[test]
     fn test_basic_dataset() {
         let labels = Float64Array::from(vec![0.0, 1.0, 0.0, 1.0, 0.0]);
-        let ds = Dataset::from_arrow(&make_features(), &labels, None, 1);
+        let ds = Dataset::from_arrow(&make_features(), &labels, None, 255, 1);
         assert_eq!(ds.num_rows, 5);
         assert_eq!(ds.num_features, 1);
         assert_eq!(ds.feature_names, vec!["x"]);
@@ -126,7 +127,7 @@ mod tests {
         let features = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(dict)]).unwrap();
         let labels = Float64Array::from(vec![0.0, 1.0, 0.0, 1.0, 0.0]);
 
-        let ds = Dataset::from_arrow(&features, &labels, None, 1);
+        let ds = Dataset::from_arrow(&features, &labels, None, 255, 1);
         assert_eq!(ds.num_features, 1);
         assert!(matches!(ds.feature_binners[0], FeatureBinner::Categorical(_)));
         assert_eq!(ds.feature_binners[0].num_bins(), 4); // 3 categories + sentinel

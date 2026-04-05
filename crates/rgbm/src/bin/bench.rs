@@ -49,7 +49,7 @@ fn main() {
     let batch = RecordBatch::try_new(schema, columns).unwrap();
     let labels_arr = Float64Array::from(labels);
 
-    let dataset = Dataset::from_arrow(&batch, &labels_arr, None, 20);
+    let dataset = Dataset::from_arrow(&batch, &labels_arr, None, 255, 20);
 
     let params = Parameters {
         num_iterations: 100,

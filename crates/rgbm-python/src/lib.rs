@@ -65,7 +65,7 @@ impl GradientBooster {
         let batch = RecordBatch::from_pyarrow_bound(x)?;
         let labels = Float64Array::from(ArrayData::from_pyarrow_bound(y)?);
         let p = &self.booster.parameters;
-        let dataset = Dataset::from_arrow(&batch, &labels, None, p.min_data_in_bin);
+        let dataset = Dataset::from_arrow(&batch, &labels, None, p.max_bin, p.min_data_in_bin);
         py.allow_threads(|| self.booster.fit(&dataset));
         Ok(())
     }
