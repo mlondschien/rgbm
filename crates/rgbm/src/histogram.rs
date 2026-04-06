@@ -270,8 +270,8 @@ impl Histogram {
         let mut left_hessian = 0.0;
         let mut best_score = f64::NEG_INFINITY;
         let mut best_threshold = 0usize;
-        let mut best_missing_goes_left = false;  // ignored
-
+        let mut best_majority_goes_left = false;
+    
         for t in 0..categorical_order.len() - 1 {
             let bin = &self.bins[categorical_order[t].1];
             left_gradient += bin.sum_gradients;
@@ -280,25 +280,30 @@ impl Histogram {
             let right_gradient = total_gradient - left_gradient;
             let right_hessian = total_hessian - left_hessian;
 
+            let majority_goes_left = left_hessian > right_hessian;
+
             evaluate_split(
                 left_gradient, left_hessian, right_gradient, right_hessian,
-                false, t, parameters, 
-                &mut best_score, &mut best_threshold, &mut best_missing_goes_left
+                majority_goes_left, t, parameters, 
+                &mut best_score, &mut best_threshold, &mut best_majority_goes_left
             );
         }
 
         if best_score <= parent_score { return None; }
 
-        let mut goes_left = vec![false; num_bins - 1];
-        for &(_, k) in &categorical_order[..=best_threshold] {
-            if k == num_bins - 1{
-                best_missing_goes_left = true;
+        let mut best_missing_goes_left = best_majority_goes_left;
+        let mut goes_left = vec![best_majority_goes_left; num_bins - 1];
+    
+        for (i, &(_, k)) in categorical_order.iter().enumerate() {
+            let is_left = i <= best_threshold;
+            
+            if k == num_bins - 1 {
+                best_missing_goes_left = is_left;
             } else {
-                goes_left[k] = true;
+                goes_left[k] = is_left;
             }
         }
 
-        // todo: Route categories with zero hessian to the side with more hessian.
         Some(SplitInfo {
             gain: best_score - parent_score,
             missing_goes_left: best_missing_goes_left,
@@ -473,6 +478,59 @@ mod tests {
         let (g, h) = hist.bins.iter().fold((0.0, 0.0), |(g, h), b| (g + b.sum_gradients, h + b.sum_hessians));
         let split = hist.find_best_categorical_split(g, h, 0.0, &p()).unwrap();
         assert!(split.missing_goes_left);
+    }
+
+    #[test]
+    fn test_categorical_no_missings_missing_goes_to_majority() {
+        // No missings (sentinel empty). Left side has more hessian → missing_goes_left = true.
+        let hist = Histogram { bins: vec![
+            HistogramBin { sum_gradients: -10.0, sum_hessians: 20.0 },
+            HistogramBin { sum_gradients:  20.0, sum_hessians: 10.0 },
+            HistogramBin { sum_gradients:   0.0, sum_hessians:  0.0 }, // sentinel empty
+        ], is_categorical: true };
+        let split = hist.find_best_categorical_split(10.0, 30.0, 0.0, &p()).unwrap();
+        assert!(split.missing_goes_left);
+    }
+
+    #[test]
+    fn test_categorical_zero_hessian_bin_routed_to_majority() {
+        // Bin 2 has zero hessian: should go to the majority (heavier) side.
+        // Left (bin 0, h=15) is heavier than right (bin 1, h=5), so bin 2 goes left.
+        let hist = Histogram { bins: vec![
+            HistogramBin { sum_gradients: -10.0, sum_hessians: 15.0 },
+            HistogramBin { sum_gradients:  20.0, sum_hessians:  5.0 },
+            HistogramBin { sum_gradients:   0.0, sum_hessians:  0.0 }, // zero hessian
+            HistogramBin { sum_gradients:   0.0, sum_hessians:  0.0 }, // sentinel
+        ], is_categorical: true };
+        let split = hist.find_best_categorical_split(10.0, 20.0, 0.0, &p()).unwrap();
+        match &split.threshold {
+            Threshold::Categorical(goes_left) => {
+                assert!(goes_left[0], "bin 0 goes left");
+                assert!(!goes_left[1], "bin 1 goes right");
+                assert!(goes_left[2], "zero-hessian bin goes to majority (left, h=15 > h=5)");
+            }
+            _ => panic!("expected categorical threshold"),
+        }
+    }
+
+    #[test]
+    fn test_categorical_missing_placed_by_fisher_sort() {
+        // Sentinel has strongly positive gradient: Fisher sort puts it on the right side.
+        // bin 0: ratio=-2, goes left. sentinel: ratio=1.0, bin 1: ratio=1.33, both go right.
+        let hist = Histogram { bins: vec![
+            HistogramBin { sum_gradients: -10.0, sum_hessians:  5.0 },
+            HistogramBin { sum_gradients:  20.0, sum_hessians: 15.0 },
+            HistogramBin { sum_gradients:  10.0, sum_hessians: 10.0 }, // sentinel (missings)
+        ], is_categorical: true };
+        let split = hist.find_best_categorical_split(20.0, 30.0, 0.0, &p()).unwrap();
+        assert!(!split.missing_goes_left);
+        match &split.threshold {
+            Threshold::Categorical(goes_left) => {
+                assert!(goes_left[0], "bin 0 goes left");
+                assert!(!goes_left[1], "bin 1 goes right");
+            }
+            _ => panic!("expected categorical threshold"),
+        }
     }
 
 }
