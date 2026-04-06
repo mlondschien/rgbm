@@ -13,9 +13,9 @@ pub struct HistogramBin {
 
 impl HistogramBin {
     #[inline(always)]
-    pub fn add(&mut self, gh: [f64; 2]) {
-        self.sum_gradients += gh[0];
-        self.sum_hessians += gh[1];
+    pub fn add(&mut self, gh: [f32; 2]) {
+        self.sum_gradients += gh[0] as f64;
+        self.sum_hessians += gh[1] as f64;
     }
 }
 
@@ -56,7 +56,7 @@ impl Histogram {
     /// One 32-bit load per row replaces up to 4 separate byte loads.
     /// SAFETY: bin values are in 0..num_bins[i] (sentinel is at index num_bins[i] - 1),
     /// histograms are sized num_bins[i].
-    pub fn build(bundle: &FeatureBundle, grad_hess: &[[f64; 2]], row_indices: &[u32]) -> Vec<Self> {
+    pub fn build(bundle: &FeatureBundle, grad_hess: &[[f32; 2]], row_indices: &[u32]) -> Vec<Self> {
         // unwrap_or(1) for the case where the bundle has fewer than 4 features.
         let n0 = bundle.num_bins.get(0).copied().unwrap_or(1);
         let n1 = bundle.num_bins.get(1).copied().unwrap_or(1);
@@ -99,15 +99,15 @@ impl Histogram {
                 let bin3_1 = (packed1 >> 24) as usize;
 
                 (*p0.add(bin0_0)).add(gh0);
-                (*p0.add(bin0_1)).add(gh1);
-
                 (*p1.add(bin1_0)).add(gh0);
-                (*p1.add(bin1_1)).add(gh1);
-
                 (*p2.add(bin2_0)).add(gh0);
-                (*p2.add(bin2_1)).add(gh1);
                 (*p3.add(bin3_0)).add(gh0);
+                
+                (*p0.add(bin0_1)).add(gh1);
+                (*p1.add(bin1_1)).add(gh1);
+                (*p2.add(bin2_1)).add(gh1);
                 (*p3.add(bin3_1)).add(gh1);
+
             }
         }
 
@@ -371,8 +371,8 @@ mod tests {
         }
     }
 
-    fn make_gh(gradients: &[f64], hessians: &[f64]) -> Vec<[f64; 2]> {
-        gradients.iter().zip(hessians).map(|(&g, &h)| [g, h]).collect()
+    fn make_gh(gradients: &[f64], hessians: &[f64]) -> Vec<[f32; 2]> {
+        gradients.iter().zip(hessians).map(|(&g, &h)| [g as f32, h as f32]).collect()
     }
 
     #[test]

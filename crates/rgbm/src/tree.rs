@@ -90,7 +90,7 @@ impl Tree {
         Self { nodes: Vec::with_capacity(2 * max_leaves) }
     }
 
-    pub fn fit(&mut self, dataset: &Dataset, grad_hess: &[[f64; 2]], p: &Parameters) -> Vec<u32> {
+    pub fn fit(&mut self, dataset: &Dataset, grad_hess: &[[f32; 2]], p: &Parameters) -> Vec<u32> {
         self.nodes.clear();
         let mut leaf_indices = vec![0u32; dataset.num_rows];
         let mut left_buffer = vec![0u32; dataset.num_rows];
@@ -218,7 +218,7 @@ impl Tree {
         node_idx
     }
 
-    fn build_histograms(dataset: &Dataset, grad_hess: &[[f64; 2]], indices: &[u32]) -> Vec<Histogram> {
+    fn build_histograms(dataset: &Dataset, grad_hess: &[[f32; 2]], indices: &[u32]) -> Vec<Histogram> {
         let mut hists = Vec::with_capacity(dataset.num_features);
         for b in &dataset.feature_bundles {
             hists.extend(Histogram::build(b, grad_hess, indices));

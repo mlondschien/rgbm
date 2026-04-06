@@ -33,7 +33,7 @@ impl Booster {
         self.base_score = self.objective.initial_score(labels);
 
         let mut scores = vec![self.base_score; dataset.num_rows];
-        let mut grad_hess = vec![[0.0f64; 2]; dataset.num_rows];
+        let mut grad_hess = vec![[0.0f32; 2]; dataset.num_rows];
 
         self.trees.clear();
 

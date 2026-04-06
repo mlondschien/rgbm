@@ -1,11 +1,11 @@
 /// Objective function for gradient boosting — computes per-row gradients and hessians.
 pub trait Objective: Send + Sync {
-    fn gradient(&self, label: f64, score: f64) -> f64;
-    fn hessian(&self, label: f64, score: f64) -> f64;
+    fn gradient(&self, label: f64, score: f64) -> f32;
+    fn hessian(&self, label: f64, score: f64) -> f32;
     fn initial_score(&self, labels: &[f64]) -> f64;
     fn prediction(&self, score: f64) -> f64;
 
-    fn gradient_hessian(&self, labels: &[f64], scores: &[f64], out: &mut [[f64; 2]]) {
+    fn gradient_hessian(&self, labels: &[f64], scores: &[f64], out: &mut [[f32; 2]]) {
         for ((gh, &label), &score) in out.iter_mut().zip(labels).zip(scores) {
             gh[0] = self.gradient(label, score);
             gh[1] = self.hessian(label, score);
@@ -16,11 +16,11 @@ pub trait Objective: Send + Sync {
 pub struct SquaredLoss;
 
 impl Objective for SquaredLoss {
-    fn gradient(&self, label: f64, score: f64) -> f64 {
-        score - label
+    fn gradient(&self, label: f64, score: f64) -> f32 {
+        (score - label) as f32
     }
 
-    fn hessian(&self, _label: f64, _score: f64) -> f64 {
+    fn hessian(&self, _label: f64, _score: f64) -> f32 {
         1.0
     }
 
@@ -37,20 +37,20 @@ impl Objective for SquaredLoss {
 pub struct BinaryLogloss;
 
 impl Objective for BinaryLogloss {
-    fn gradient(&self, label: f64, score: f64) -> f64 {
-        self.prediction(score) - label
+    fn gradient(&self, label: f64, score: f64) -> f32 {
+        (self.prediction(score) - label) as f32
     }
 
-    fn hessian(&self, _label: f64, score: f64) -> f64 {
+    fn hessian(&self, _label: f64, score: f64) -> f32 {
         let p = self.prediction(score);
-        (p * (1.0 - p)).max(1e-16)
+        (p * (1.0 - p)).max(1e-16) as f32
     }
 
-    fn gradient_hessian(&self, labels: &[f64], scores: &[f64], out: &mut [[f64; 2]]) {
+    fn gradient_hessian(&self, labels: &[f64], scores: &[f64], out: &mut [[f32; 2]]) {
         for ((gh, &label), &score) in out.iter_mut().zip(labels).zip(scores) {
             let p = self.prediction(score);
-            gh[0] = p - label;
-            gh[1] = (p * (1.0 - p)).max(1e-16);
+            gh[0] = (p - label) as f32;
+            gh[1] = (p * (1.0 - p)).max(1e-16) as f32;
         }
     }
 
@@ -80,24 +80,24 @@ impl Probit {
 }
 
 impl Objective for Probit {
-    fn gradient(&self, label: f64, score: f64) -> f64 {
+    fn gradient(&self, label: f64, score: f64) -> f32 {
         let p = Self::norm_cdf(score).clamp(1e-7, 1.0 - 1e-7);
-        Self::norm_pdf(score) * (p - label) / (p * (1.0 - p))
+        (Self::norm_pdf(score) * (p - label) / (p * (1.0 - p))) as f32
     }
 
-    fn hessian(&self, _label: f64, score: f64) -> f64 {
+    fn hessian(&self, _label: f64, score: f64) -> f32 {
         let p = Self::norm_cdf(score).clamp(1e-7, 1.0 - 1e-7);
         let phi = Self::norm_pdf(score);
-        (phi * phi / (p * (1.0 - p))).max(1e-16)
+        (phi * phi / (p * (1.0 - p))).max(1e-16) as f32
     }
 
-    fn gradient_hessian(&self, labels: &[f64], scores: &[f64], out: &mut [[f64; 2]]) {
+    fn gradient_hessian(&self, labels: &[f64], scores: &[f64], out: &mut [[f32; 2]]) {
         for ((gh, &label), &score) in out.iter_mut().zip(labels).zip(scores) {
             let p = Self::norm_cdf(score).clamp(1e-7, 1.0 - 1e-7);
             let phi = Self::norm_pdf(score);
             let v = p * (1.0 - p);
-            gh[0] = phi * (p - label) / v;
-            gh[1] = (phi * phi / v).max(1e-16);
+            gh[0] = (phi * (p - label) / v) as f32;
+            gh[1] = (phi * phi / v).max(1e-16) as f32;
         }
     }
 
