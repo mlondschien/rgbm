@@ -1,6 +1,7 @@
 use arrow::array::{Float64Array, PrimitiveArray};
 use arrow::datatypes::Float64Type;
 use arrow::record_batch::RecordBatch;
+use rayon;
 
 use crate::bin::FeatureBinner;
 use crate::dataset::Dataset;
@@ -35,13 +36,23 @@ impl Booster {
         let mut scores = vec![self.base_score; dataset.num_rows];
         let mut grad_hess = vec![[0.0f32; 2]; dataset.num_rows];
 
+        let n_threads = match self.parameters.n_jobs {
+            n if n <= 0 => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+            n => n as usize,
+        };
+        let pool = if n_threads > 1 {
+            Some(rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap())
+        } else {
+            None
+        };
+
         self.trees.clear();
 
         for _ in 0..self.parameters.num_iterations {
             self.objective.gradient_hessian(labels, &scores, &mut grad_hess);
 
             let mut tree = Tree::new(self.parameters.max_leaves);
-            let leaf_indices = tree.fit(dataset, &grad_hess, &self.parameters);
+            let leaf_indices = tree.fit(dataset, &grad_hess, &self.parameters, pool.as_ref());
 
             for (score, &leaf_idx) in scores.iter_mut().zip(&leaf_indices) {
                 *score += tree.nodes[leaf_idx as usize].value;

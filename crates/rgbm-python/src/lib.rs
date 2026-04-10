@@ -29,6 +29,7 @@ impl GradientBooster {
         min_data_in_bin = 3,
         max_leaves = 31,
         leaf_wise = true,
+        n_jobs = -1,
     ))]
     fn new(
         objective: &str,
@@ -42,6 +43,7 @@ impl GradientBooster {
         min_data_in_bin: usize,
         max_leaves: usize,
         leaf_wise: bool,
+        n_jobs: isize,
     ) -> PyResult<Self> {
         let obj: Box<dyn Objective> = match objective {
             "squared_loss"   => Box::new(SquaredLoss),
@@ -56,7 +58,7 @@ impl GradientBooster {
             booster: Booster::new(Parameters {
                 num_iterations, learning_rate, max_depth,
                 min_sum_hessian_in_leaf,
-                lambda_l1, lambda_l2, max_bin, min_data_in_bin, max_leaves, leaf_wise,
+                lambda_l1, lambda_l2, max_bin, min_data_in_bin, max_leaves, leaf_wise, n_jobs,
             }, obj),
         })
     }

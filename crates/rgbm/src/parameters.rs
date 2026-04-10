@@ -14,6 +14,7 @@ pub struct Parameters {
     pub min_sum_hessian_in_leaf: f64,
     pub lambda_l1: f64,
     pub lambda_l2: f64,
+    pub n_jobs: isize,
 }
 
 impl Default for Parameters {
@@ -29,6 +30,7 @@ impl Default for Parameters {
             min_sum_hessian_in_leaf: 1e-3,
             lambda_l1: 0.0,
             lambda_l2: 0.0,
+            n_jobs: -1,
         }
     }
 }

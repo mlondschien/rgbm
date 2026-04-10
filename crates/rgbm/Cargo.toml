@@ -8,3 +8,4 @@ arrow = { workspace = true }
 rand = { workspace = true }
 ahash = { workspace = true }
 libm = { workspace = true }
+rayon = { workspace = true }

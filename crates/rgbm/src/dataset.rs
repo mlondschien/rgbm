@@ -3,20 +3,18 @@ use arrow::array::{Float64Array, RecordBatch};
 use crate::bin::FeatureBinner;
 
 /// FeatureBundle stores the features' bin indices.
-/// Bin values are u8. Like LGBM, we pack up to 4 of these into a single u32 (1 byte).
-/// This improves memory bandwidth in histogram builing, the part of the algorithm where
-/// >90% of time is spent.
+/// Bin values are u8. We pack up to 4 of these into a single u32 (1 byte).
+/// This improves memory bandwidth in histogram builing.
 pub struct FeatureBundle {
     pub packed_bins: Vec<u32>,
     pub feature_indices: Vec<usize>,
-    pub num_bins: Vec<usize>,
+    pub num_bins: Vec<usize>,  // including the sentinel bin.
     pub is_categorical: Vec<bool>,
-    pub count: usize, // number of features in the bundle
+    pub count: usize, // number of features in the bundle.
 }
 
 impl FeatureBundle {
-    fn pack(binners: &[&FeatureBinner], bins: &[Vec<u8>], feature_indices: Vec<usize>, num_rows: usize) -> Self {
-        let count = binners.len();
+    fn pack(binners: &[FeatureBinner], bins: &[Vec<u8>], feature_indices: Vec<usize>, num_rows: usize) -> Self {
         let mut packed_bins = vec![0u32; num_rows];
         for (slot, col) in bins.iter().enumerate() {
             let shift = slot * 8;
@@ -26,7 +24,7 @@ impl FeatureBundle {
         }
         let num_bins: Vec<usize> = binners.iter().map(|b| b.num_bins()).collect();
         let is_categorical: Vec<bool> = binners.iter().map(|b| b.is_categorical()).collect();
-        Self { packed_bins, feature_indices, num_bins, is_categorical, count }
+        Self { packed_bins, feature_indices, num_bins, is_categorical, count: binners.len() }
     }
 }
 
@@ -55,6 +53,7 @@ impl Dataset {
         let mut feature_names = Vec::with_capacity(num_features);
         let mut all_bins: Vec<Vec<u8>> = Vec::with_capacity(num_features);
 
+        // build feature_binners and create binned feature columns [u8].
         for (field, array) in features.schema().fields().iter().zip(features.columns()) {
             feature_names.push(field.name().clone());
             let binner = FeatureBinner::new(array.as_ref(), max_bin, min_data_in_bin);
@@ -63,14 +62,13 @@ impl Dataset {
         }
 
         let num_rows = features.num_rows();
-
-        let binner_refs: Vec<&FeatureBinner> = feature_binners.iter().collect();
-        let feature_bundles: Vec<FeatureBundle> = binner_refs.chunks(4)
+        let feature_bundles: Vec<FeatureBundle> = feature_binners.chunks(4)
             .zip(all_bins.chunks(4))
             .enumerate()
             .map(|(chunk_idx, (chunk_binners, chunk_bins))| {
                 let start = chunk_idx * 4;
                 let feature_indices = (start..start + chunk_binners.len()).collect();
+                
                 FeatureBundle::pack(chunk_binners, chunk_bins, feature_indices, num_rows)
             })
             .collect();

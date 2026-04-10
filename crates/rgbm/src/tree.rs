@@ -1,9 +1,10 @@
 use arrow::array::{Array, PrimitiveArray};
 use arrow::datatypes::Float64Type;
+use rayon::prelude::*;
 
 use crate::bin::FeatureBinner;
 use crate::dataset::Dataset;
-use crate::histogram::{Histogram, SplitInfo, Threshold};
+use crate::histogram::{Histograms, SplitInfo, Threshold};
 use crate::parameters::Parameters;
 use crate::histogram::calculate_score;
 
@@ -47,37 +48,8 @@ pub struct ActiveLeaf {
     start: usize,
     len: usize,
     depth: usize,
-    histograms: Vec<Histogram>,
+    histograms: Histograms,
     best_split: SplitInfo,
-}
-
-
-
-fn find_best_split(
-    p: &Parameters,
-    histograms: &[Histogram],
-    total_gradient: f64,
-    total_hessian: f64,
-    parent_score: f64,
-    depth: usize,
-) -> Option<SplitInfo> {
-    if depth >= p.max_depth || total_hessian < p.min_sum_hessian_in_leaf * 2.0 {
-        return None;
-    }
-
-    let mut best_split: Option<SplitInfo> = None;
-
-    for f in 0..histograms.len() {
-        if let Some(mut split) = histograms[f].find_best_split(total_gradient, total_hessian, parent_score, p) {
-            split.feature_index = f;
-
-            if best_split.as_ref().map_or(true, |best| split.gain > best.gain) {
-                best_split = Some(split);
-            }
-        }
-    }
-
-    best_split
 }
 
 #[derive(Clone)]
@@ -90,7 +62,7 @@ impl Tree {
         Self { nodes: Vec::with_capacity(2 * max_leaves) }
     }
 
-    pub fn fit(&mut self, dataset: &Dataset, grad_hess: &[[f32; 2]], p: &Parameters) -> Vec<u32> {
+    pub fn fit(&mut self, dataset: &Dataset, grad_hess: &[[f32; 2]], p: &Parameters, pool: Option<&rayon::ThreadPool>) -> Vec<u32> {
         self.nodes.clear();
         let mut leaf_indices = vec![0u32; dataset.num_rows];
         let mut left_buffer = vec![0u32; dataset.num_rows];
@@ -98,7 +70,7 @@ impl Tree {
         let mut all_indices: Vec<u32> = (0..dataset.num_rows as u32).collect();
         let mut active_leafs: Vec<ActiveLeaf> = Vec::new();
 
-        let root_histograms = Self::build_histograms(dataset, grad_hess, &all_indices);
+        let root_histograms = Histograms::build(&dataset.feature_bundles, grad_hess, &all_indices, pool);
         self.push_leaf(&mut active_leafs, &mut leaf_indices, &all_indices, root_histograms, 0, dataset.num_rows, 0, p);
         let mut num_leaves = 1;
 
@@ -117,13 +89,15 @@ impl Tree {
             let right_len = leaf.len - split_position;
 
             // Build the smaller child directly, derive the larger by subtracting
-            let (left_histograms, right_histograms);
+            let (mut left_histograms, mut right_histograms);
             if left_len < right_len {
-                left_histograms = Self::build_histograms(dataset, grad_hess, &all_indices[left_start..left_start + left_len]);
-                right_histograms = Self::subtract_histograms(dataset.num_features, &leaf.histograms, &left_histograms);
+                left_histograms = Histograms::build(&dataset.feature_bundles, grad_hess, &all_indices[left_start..left_start + left_len], pool);
+                right_histograms = leaf.histograms;
+                right_histograms.subtract(&left_histograms);
             } else {
-                right_histograms = Self::build_histograms(dataset, grad_hess, &all_indices[right_start..right_start + right_len]);
-                left_histograms = Self::subtract_histograms(dataset.num_features, &leaf.histograms, &right_histograms);
+                right_histograms = Histograms::build(&dataset.feature_bundles, grad_hess, &all_indices[right_start..right_start + right_len], pool);
+                left_histograms = leaf.histograms;
+                left_histograms.subtract(&right_histograms);
             }
 
             let left_node_idx = self.push_leaf(&mut active_leafs, &mut leaf_indices, &all_indices, left_histograms, left_start, left_len, leaf.depth + 1, p);
@@ -190,24 +164,33 @@ impl Tree {
         active_leafs: &mut Vec<ActiveLeaf>,
         leaf_indices: &mut Vec<u32>,
         all_indices: &[u32],
-        histograms: Vec<Histogram>,
+        histograms: Histograms,
         start: usize,
         len: usize,
         depth: usize,
         p: &Parameters,
     ) -> usize {
-        // todo: This will panic if there's no features.
-        let (gradient, hessian) = histograms[0].bins.iter()
+        // This returns 0 if there's no features.
+        let end = histograms.offsets.get(1).copied().unwrap_or(histograms.bins.len());
+        let (gradient, hessian) = histograms.bins[..end].iter()
             .fold((0.0, 0.0), |(g, h), b| (g + b.sum_gradients, h + b.sum_hessians));
         let score = calculate_score(gradient, hessian, p.lambda_l1, p.lambda_l2);
-        let value =calculate_value(gradient, hessian, p.lambda_l1, p.lambda_l2) * p.learning_rate;
+        let value = calculate_value(gradient, hessian, p.lambda_l1, p.lambda_l2) * p.learning_rate;
         let node_idx = self.nodes.len();
+
         self.nodes.push(Node {
             is_leaf: true, left_child: 0, right_child: 0, split_feature: 0,
             threshold: FinalThreshold::Numeric(0.0), missing_goes_left: false,
             value: value,
         });
-        match find_best_split(p, &histograms, gradient, hessian, score, depth) {
+
+        let best_split = if depth >= p.max_depth || hessian < p.min_sum_hessian_in_leaf * 2.0 {
+            None
+        } else {
+            histograms.find_best_split(gradient, hessian, score, p)
+        };
+
+        match best_split {
             Some(best_split) => active_leafs.push(ActiveLeaf { leaf_index: node_idx, start, len, depth, histograms, best_split }),
             None => {
                 for &row in &all_indices[start..start + len] {
@@ -218,21 +201,6 @@ impl Tree {
         node_idx
     }
 
-    fn build_histograms(dataset: &Dataset, grad_hess: &[[f32; 2]], indices: &[u32]) -> Vec<Histogram> {
-        let mut hists = Vec::with_capacity(dataset.num_features);
-        for b in &dataset.feature_bundles {
-            hists.extend(Histogram::build(b, grad_hess, indices));
-        }
-        hists
-    }
-
-    fn subtract_histograms(num_features: usize, parent: &[Histogram], child: &[Histogram]) -> Vec<Histogram> {
-        (0..num_features).map(|f| {
-            let mut h = Histogram::zeros(child[f].bins.len(), child[f].is_categorical);
-            h.subtract(&parent[f], &child[f]);
-            h
-        }).collect()
-    }
 
     fn partition_indices(&self, dataset: &Dataset, indices: &mut [u32], split: &SplitInfo, left_buffer: &mut [u32], right_buffer: &mut [u32]) -> usize {
         let bundle_idx = split.feature_index / 4;

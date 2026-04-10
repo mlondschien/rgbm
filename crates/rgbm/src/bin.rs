@@ -140,6 +140,7 @@ impl FeatureBinner {
         }
     }
 
+    // Number of bins, including the sentinel bin.
     pub fn num_bins(&self) -> usize {
         match self {
             // For bins (-inf, 0), [0, inf), and missings -> upper_bounds = [0.0],
