@@ -1,6 +1,5 @@
 use arrow::array::{Array, PrimitiveArray};
 use arrow::datatypes::Float64Type;
-use rayon::prelude::*;
 
 use crate::bin::FeatureBinner;
 use crate::dataset::Dataset;
@@ -67,10 +66,16 @@ impl Tree {
         let mut leaf_indices = vec![0u32; dataset.num_rows];
         let mut left_buffer = vec![0u32; dataset.num_rows];
         let mut right_buffer = vec![0u32; dataset.num_rows];
+        let mut gh_left_buffer = vec![[0.0f32; 2]; dataset.num_rows];
+        let mut gh_right_buffer = vec![[0.0f32; 2]; dataset.num_rows];
         let mut all_indices: Vec<u32> = (0..dataset.num_rows as u32).collect();
+        // ordered_gh[i] = grad_hess[all_indices[i]], maintained as we partition all_indices.
+        // This means Histograms::build gets a pre-ordered slice with no per-build allocation.
+        let mut ordered_gh = grad_hess.to_vec();
         let mut active_leafs: Vec<ActiveLeaf> = Vec::new();
 
-        let root_histograms = Histograms::build(&dataset.feature_bundles, grad_hess, &all_indices, pool);
+        let root_histograms = Histograms::build(&dataset.feature_bundles, &ordered_gh, &all_indices, pool);
+
         self.push_leaf(&mut active_leafs, &mut leaf_indices, &all_indices, root_histograms, 0, dataset.num_rows, 0, p);
         let mut num_leaves = 1;
 
@@ -81,7 +86,10 @@ impl Tree {
             let leaf = active_leafs.swap_remove(idx);
 
             let split_position = self.partition_indices(
-                dataset, &mut all_indices[leaf.start..leaf.start + leaf.len], &leaf.best_split, &mut left_buffer, &mut right_buffer);
+                dataset, &mut all_indices[leaf.start..leaf.start + leaf.len],
+                &mut ordered_gh[leaf.start..leaf.start + leaf.len],
+                &leaf.best_split, &mut left_buffer, &mut right_buffer,
+                &mut gh_left_buffer, &mut gh_right_buffer);
 
             let left_start = leaf.start;
             let left_len = split_position;
@@ -91,11 +99,11 @@ impl Tree {
             // Build the smaller child directly, derive the larger by subtracting
             let (mut left_histograms, mut right_histograms);
             if left_len < right_len {
-                left_histograms = Histograms::build(&dataset.feature_bundles, grad_hess, &all_indices[left_start..left_start + left_len], pool);
+                left_histograms = Histograms::build(&dataset.feature_bundles, &ordered_gh[left_start..left_start + left_len], &all_indices[left_start..left_start + left_len], pool);
                 right_histograms = leaf.histograms;
                 right_histograms.subtract(&left_histograms);
             } else {
-                right_histograms = Histograms::build(&dataset.feature_bundles, grad_hess, &all_indices[right_start..right_start + right_len], pool);
+                right_histograms = Histograms::build(&dataset.feature_bundles, &ordered_gh[right_start..right_start + right_len], &all_indices[right_start..right_start + right_len], pool);
                 left_histograms = leaf.histograms;
                 left_histograms.subtract(&right_histograms);
             }
@@ -202,13 +210,13 @@ impl Tree {
     }
 
 
-    fn partition_indices(&self, dataset: &Dataset, indices: &mut [u32], split: &SplitInfo, left_buffer: &mut [u32], right_buffer: &mut [u32]) -> usize {
+    fn partition_indices(&self, dataset: &Dataset, indices: &mut [u32], ordered_gh: &mut [[f32; 2]], split: &SplitInfo, left_buffer: &mut [u32], right_buffer: &mut [u32], gh_left_buffer: &mut [[f32; 2]], gh_right_buffer: &mut [[f32; 2]]) -> usize {
         let bundle_idx = split.feature_index / 4;
         let shift = (split.feature_index % 4) * 8;
         let packed_bins = &dataset.feature_bundles[bundle_idx].packed_bins;
-        
+
         let sentinel = (dataset.feature_binners[split.feature_index].num_bins() - 1) as u8;
-        
+
         let missing = split.missing_goes_left as usize;
         let mut left_count = 0usize;
         let mut right_count = 0usize;
@@ -216,21 +224,25 @@ impl Tree {
         match &split.threshold {
             Threshold::Numeric(t) => {
                 let t = *t as u8;
-                for &row in indices.iter() {
+                for (&row, &gh) in indices.iter().zip(ordered_gh.iter()) {
                     let bin = ((packed_bins[row as usize] >> shift) & 0xFF) as u8;
                     let goes_left = if bin == sentinel { missing } else { (bin <= t) as usize };
                     left_buffer[left_count] = row;
+                    gh_left_buffer[left_count] = gh;
                     right_buffer[right_count] = row;
+                    gh_right_buffer[right_count] = gh;
                     left_count += goes_left;
                     right_count += 1 - goes_left;
                 }
             }
             Threshold::Categorical(cats) => {
-                for &row in indices.iter() {
+                for (&row, &gh) in indices.iter().zip(ordered_gh.iter()) {
                     let bin = ((packed_bins[row as usize] >> shift) & 0xFF) as usize;
                     let goes_left = if bin == sentinel as usize { missing } else { cats[bin] as usize };
                     left_buffer[left_count] = row;
+                    gh_left_buffer[left_count] = gh;
                     right_buffer[right_count] = row;
+                    gh_right_buffer[right_count] = gh;
                     left_count += goes_left;
                     right_count += 1 - goes_left;
                 }
@@ -239,6 +251,8 @@ impl Tree {
 
         indices[..left_count].copy_from_slice(&left_buffer[..left_count]);
         indices[left_count..].copy_from_slice(&right_buffer[..right_count]);
+        ordered_gh[..left_count].copy_from_slice(&gh_left_buffer[..left_count]);
+        ordered_gh[left_count..].copy_from_slice(&gh_right_buffer[..right_count]);
         left_count
     }
 }

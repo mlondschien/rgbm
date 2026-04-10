@@ -68,7 +68,7 @@ impl Histograms {
     /// One 32-bit load per row replaces up to 4 separate byte loads.
     /// SAFETY: bin values are in 0..num_bins[i] (sentinel is at index num_bins[i] - 1),
     /// histograms are sized num_bins[i].
-    pub fn build_into(bundle: &FeatureBundle, grad_hess: &[[f32; 2]], row_indices: &[u32], bins: &mut [HistogramBin]) {
+    pub fn build_into(bundle: &FeatureBundle, packed_gh: &[[f32; 2]], row_indices: &[u32], bins: &mut [HistogramBin]) {
         let p0 = bins.as_mut_ptr();
 
         match bundle.count {
@@ -82,13 +82,14 @@ impl Histograms {
                 // the possible leftover chunk below.
                 // with 2x unrolling and 4 features per chunk, data/pointers in one loop fit
                 // comfortably into modern CPU registers.
-                let mut chunks = row_indices.chunks_exact(2);
-                for chunk in &mut chunks {
-                    let row0 = chunk[0] as usize;
-                    let row1 = chunk[1] as usize;
+                let mut row_chunks = row_indices.chunks_exact(2);
+                let mut gh_chunks = packed_gh.chunks_exact(2);
+                for (row_chunk, gh_chunk) in row_chunks.by_ref().zip(gh_chunks.by_ref()) {
+                    let row0 = row_chunk[0] as usize;
+                    let row1 = row_chunk[1] as usize;
                     unsafe {
-                        let gh0 = *grad_hess.get_unchecked(row0);
-                        let gh1 = *grad_hess.get_unchecked(row1);
+                        let gh0 = *gh_chunk.get_unchecked(0);
+                        let gh1 = *gh_chunk.get_unchecked(1);
                         let pk0 = *bundle.packed_bins.get_unchecked(row0);
                         let pk1 = *bundle.packed_bins.get_unchecked(row1);
 
@@ -103,15 +104,13 @@ impl Histograms {
                         (*p3.add((pk1 >> 24) as usize)).add(gh1);
                     }
                 }
-                for &row in chunks.remainder() {
-                    let r = row as usize;
+                for (&row, gh) in row_chunks.remainder().iter().zip(gh_chunks.remainder()) {
                     unsafe {
-                        let gh = *grad_hess.get_unchecked(r);
-                        let pk = *bundle.packed_bins.get_unchecked(r);
-                        (*p0.add((pk & 0xFF) as usize)).add(gh);
-                        (*p1.add(((pk >> 8) & 0xFF) as usize)).add(gh);
-                        (*p2.add(((pk >> 16) & 0xFF) as usize)).add(gh);
-                        (*p3.add((pk >> 24) as usize)).add(gh);
+                        let pk = *bundle.packed_bins.get_unchecked(row as usize);
+                        (*p0.add((pk & 0xFF) as usize)).add(*gh);
+                        (*p1.add(((pk >> 8) & 0xFF) as usize)).add(*gh);
+                        (*p2.add(((pk >> 16) & 0xFF) as usize)).add(*gh);
+                        (*p3.add((pk >> 24) as usize)).add(*gh);
                     }
                 }
             }
@@ -119,13 +118,14 @@ impl Histograms {
                 let p1 = unsafe { p0.add(bundle.num_bins[0]) };
                 let p2 = unsafe { p1.add(bundle.num_bins[1]) };
 
-                let mut chunks = row_indices.chunks_exact(2);
-                for chunk in &mut chunks {
-                    let row0 = chunk[0] as usize;
-                    let row1 = chunk[1] as usize;
+                let mut row_chunks = row_indices.chunks_exact(2);
+                let mut gh_chunks = packed_gh.chunks_exact(2);
+                for (row_chunk, gh_chunk) in row_chunks.by_ref().zip(gh_chunks.by_ref()) {
+                    let row0 = row_chunk[0] as usize;
+                    let row1 = row_chunk[1] as usize;
                     unsafe {
-                        let gh0 = *grad_hess.get_unchecked(row0);
-                        let gh1 = *grad_hess.get_unchecked(row1);
+                        let gh0 = *gh_chunk.get_unchecked(0);
+                        let gh1 = *gh_chunk.get_unchecked(1);
                         let pk0 = *bundle.packed_bins.get_unchecked(row0);
                         let pk1 = *bundle.packed_bins.get_unchecked(row1);
 
@@ -138,27 +138,26 @@ impl Histograms {
                         (*p2.add(((pk1 >> 16) & 0xFF) as usize)).add(gh1);
                     }
                 }
-                for &row in chunks.remainder() {
-                    let r = row as usize;
+                for (&row, gh) in row_chunks.remainder().iter().zip(gh_chunks.remainder()) {
                     unsafe {
-                        let gh = *grad_hess.get_unchecked(r);
-                        let pk = *bundle.packed_bins.get_unchecked(r);
-                        (*p0.add((pk & 0xFF) as usize)).add(gh);
-                        (*p1.add(((pk >> 8) & 0xFF) as usize)).add(gh);
-                        (*p2.add(((pk >> 16) & 0xFF) as usize)).add(gh);
+                        let pk = *bundle.packed_bins.get_unchecked(row as usize);
+                        (*p0.add((pk & 0xFF) as usize)).add(*gh);
+                        (*p1.add(((pk >> 8) & 0xFF) as usize)).add(*gh);
+                        (*p2.add(((pk >> 16) & 0xFF) as usize)).add(*gh);
                     }
                 }
             }
             2 => {
                 let p1 = unsafe { p0.add(bundle.num_bins[0]) };
 
-                let mut chunks = row_indices.chunks_exact(2);
-                for chunk in &mut chunks {
-                    let row0 = chunk[0] as usize;
-                    let row1 = chunk[1] as usize;
+                let mut row_chunks = row_indices.chunks_exact(2);
+                let mut gh_chunks = packed_gh.chunks_exact(2);
+                for (row_chunk, gh_chunk) in row_chunks.by_ref().zip(gh_chunks.by_ref()) {
+                    let row0 = row_chunk[0] as usize;
+                    let row1 = row_chunk[1] as usize;
                     unsafe {
-                        let gh0 = *grad_hess.get_unchecked(row0);
-                        let gh1 = *grad_hess.get_unchecked(row1);
+                        let gh0 = *gh_chunk.get_unchecked(0);
+                        let gh1 = *gh_chunk.get_unchecked(1);
                         let pk0 = *bundle.packed_bins.get_unchecked(row0);
                         let pk1 = *bundle.packed_bins.get_unchecked(row1);
 
@@ -169,24 +168,23 @@ impl Histograms {
                         (*p1.add(((pk1 >> 8) & 0xFF) as usize)).add(gh1);
                     }
                 }
-                for &row in chunks.remainder() {
-                    let r = row as usize;
+                for (&row, gh) in row_chunks.remainder().iter().zip(gh_chunks.remainder()) {
                     unsafe {
-                        let gh = *grad_hess.get_unchecked(r);
-                        let pk = *bundle.packed_bins.get_unchecked(r);
-                        (*p0.add((pk & 0xFF) as usize)).add(gh);
-                        (*p1.add(((pk >> 8) & 0xFF) as usize)).add(gh);
+                        let pk = *bundle.packed_bins.get_unchecked(row as usize);
+                        (*p0.add((pk & 0xFF) as usize)).add(*gh);
+                        (*p1.add(((pk >> 8) & 0xFF) as usize)).add(*gh);
                     }
                 }
             }
             1 => {
-                let mut chunks = row_indices.chunks_exact(2);
-                for chunk in &mut chunks {
-                    let row0 = chunk[0] as usize;
-                    let row1 = chunk[1] as usize;
+                let mut row_chunks = row_indices.chunks_exact(2);
+                let mut gh_chunks = packed_gh.chunks_exact(2);
+                for (row_chunk, gh_chunk) in row_chunks.by_ref().zip(gh_chunks.by_ref()) {
+                    let row0 = row_chunk[0] as usize;
+                    let row1 = row_chunk[1] as usize;
                     unsafe {
-                        let gh0 = *grad_hess.get_unchecked(row0);
-                        let gh1 = *grad_hess.get_unchecked(row1);
+                        let gh0 = *gh_chunk.get_unchecked(0);
+                        let gh1 = *gh_chunk.get_unchecked(1);
                         let pk0 = *bundle.packed_bins.get_unchecked(row0);
                         let pk1 = *bundle.packed_bins.get_unchecked(row1);
 
@@ -194,12 +192,10 @@ impl Histograms {
                         (*p0.add((pk1 & 0xFF) as usize)).add(gh1);
                     }
                 }
-                for &row in chunks.remainder() {
-                    let r = row as usize;
+                for (&row, gh) in row_chunks.remainder().iter().zip(gh_chunks.remainder()) {
                     unsafe {
-                        let gh = *grad_hess.get_unchecked(r);
-                        let pk = *bundle.packed_bins.get_unchecked(r);
-                        (*p0.add((pk & 0xFF) as usize)).add(gh);
+                        let pk = *bundle.packed_bins.get_unchecked(row as usize);
+                        (*p0.add((pk & 0xFF) as usize)).add(*gh);
                     }
                 }
             }
@@ -209,9 +205,9 @@ impl Histograms {
 
 
     pub fn build(
-        bundles: &[FeatureBundle], 
-        grad_hess: &[[f32; 2]], 
-        indices: &[u32], 
+        bundles: &[FeatureBundle],
+        grad_hess: &[[f32; 2]],
+        indices: &[u32],
         pool: Option<&rayon::ThreadPool>
     ) -> Self {
         let mut hists = Self::zeros(bundles);
