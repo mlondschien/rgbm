@@ -4,8 +4,34 @@ use arrow::datatypes::Float64Type;
 use crate::bin::FeatureBinner;
 use crate::dataset::Dataset;
 use crate::histogram::{Histograms, SplitInfo, Threshold};
-use crate::parameters::Parameters;
+use crate::parameters::BoosterParameters;
 use crate::histogram::calculate_score;
+
+/// Reusable scratch buffers for tree fitting, owned by the Booster and passed in each
+/// iteration to avoid repeated allocation of O(num_rows) memory.
+pub struct TreeWorkspace {
+    pub leaf_indices: Vec<u32>,
+    left_buffer: Vec<u32>,
+    right_buffer: Vec<u32>,
+    gh_left_buffer: Vec<[f32; 2]>,
+    gh_right_buffer: Vec<[f32; 2]>,
+    all_indices: Vec<u32>,
+    ordered_gh: Vec<[f32; 2]>,
+}
+
+impl TreeWorkspace {
+    pub fn new(num_rows: usize) -> Self {
+        Self {
+            leaf_indices: vec![0u32; num_rows],
+            left_buffer: vec![0u32; num_rows],
+            right_buffer: vec![0u32; num_rows],
+            gh_left_buffer: vec![[0.0f32; 2]; num_rows],
+            gh_right_buffer: vec![[0.0f32; 2]; num_rows],
+            all_indices: (0..num_rows as u32).collect(),
+            ordered_gh: vec![[0.0f32; 2]; num_rows],
+        }
+    }
+}
 
 #[derive(Clone)]
 pub enum FinalThreshold {
@@ -61,22 +87,18 @@ impl Tree {
         Self { nodes: Vec::with_capacity(2 * max_leaves) }
     }
 
-    pub fn fit(&mut self, dataset: &Dataset, grad_hess: &[[f32; 2]], p: &Parameters, pool: Option<&rayon::ThreadPool>) -> Vec<u32> {
+    pub fn fit(&mut self, dataset: &Dataset, grad_hess: &[[f32; 2]], p: &BoosterParameters, pool: Option<&rayon::ThreadPool>, workspace: &mut TreeWorkspace) {
         self.nodes.clear();
-        let mut leaf_indices = vec![0u32; dataset.num_rows];
-        let mut left_buffer = vec![0u32; dataset.num_rows];
-        let mut right_buffer = vec![0u32; dataset.num_rows];
-        let mut gh_left_buffer = vec![[0.0f32; 2]; dataset.num_rows];
-        let mut gh_right_buffer = vec![[0.0f32; 2]; dataset.num_rows];
-        let mut all_indices: Vec<u32> = (0..dataset.num_rows as u32).collect();
-        // ordered_gh[i] = grad_hess[all_indices[i]], maintained as we partition all_indices.
-        // This means Histograms::build gets a pre-ordered slice with no per-build allocation.
-        let mut ordered_gh = grad_hess.to_vec();
+
+        // Reset workspace for this tree: restore identity index order and copy grad_hess.
+        for (i, x) in workspace.all_indices.iter_mut().enumerate() { *x = i as u32; }
+        workspace.ordered_gh.copy_from_slice(grad_hess);
+
         let mut active_leafs: Vec<ActiveLeaf> = Vec::new();
 
-        let root_histograms = Histograms::build(&dataset.feature_bundles, &ordered_gh, &all_indices, pool);
+        let root_histograms = Histograms::build(&dataset.feature_bundles, &workspace.ordered_gh, &workspace.all_indices, pool);
 
-        self.push_leaf(&mut active_leafs, &mut leaf_indices, &all_indices, root_histograms, 0, dataset.num_rows, 0, p);
+        self.push_leaf(&mut active_leafs, &mut workspace.leaf_indices, &workspace.all_indices, root_histograms, 0, dataset.num_rows, 0, p, pool);
         let mut num_leaves = 1;
 
         while num_leaves < p.max_leaves && !active_leafs.is_empty() {
@@ -86,10 +108,10 @@ impl Tree {
             let leaf = active_leafs.swap_remove(idx);
 
             let split_position = self.partition_indices(
-                dataset, &mut all_indices[leaf.start..leaf.start + leaf.len],
-                &mut ordered_gh[leaf.start..leaf.start + leaf.len],
-                &leaf.best_split, &mut left_buffer, &mut right_buffer,
-                &mut gh_left_buffer, &mut gh_right_buffer);
+                dataset, &mut workspace.all_indices[leaf.start..leaf.start + leaf.len],
+                &mut workspace.ordered_gh[leaf.start..leaf.start + leaf.len],
+                &leaf.best_split, &mut workspace.left_buffer, &mut workspace.right_buffer,
+                &mut workspace.gh_left_buffer, &mut workspace.gh_right_buffer);
 
             let left_start = leaf.start;
             let left_len = split_position;
@@ -99,17 +121,17 @@ impl Tree {
             // Build the smaller child directly, derive the larger by subtracting
             let (mut left_histograms, mut right_histograms);
             if left_len < right_len {
-                left_histograms = Histograms::build(&dataset.feature_bundles, &ordered_gh[left_start..left_start + left_len], &all_indices[left_start..left_start + left_len], pool);
+                left_histograms = Histograms::build(&dataset.feature_bundles, &workspace.ordered_gh[left_start..left_start + left_len], &workspace.all_indices[left_start..left_start + left_len], pool);
                 right_histograms = leaf.histograms;
                 right_histograms.subtract(&left_histograms);
             } else {
-                right_histograms = Histograms::build(&dataset.feature_bundles, &ordered_gh[right_start..right_start + right_len], &all_indices[right_start..right_start + right_len], pool);
+                right_histograms = Histograms::build(&dataset.feature_bundles, &workspace.ordered_gh[right_start..right_start + right_len], &workspace.all_indices[right_start..right_start + right_len], pool);
                 left_histograms = leaf.histograms;
                 left_histograms.subtract(&right_histograms);
             }
 
-            let left_node_idx = self.push_leaf(&mut active_leafs, &mut leaf_indices, &all_indices, left_histograms, left_start, left_len, leaf.depth + 1, p);
-            let right_node_idx = self.push_leaf(&mut active_leafs, &mut leaf_indices, &all_indices, right_histograms, right_start, right_len, leaf.depth + 1, p);
+            let left_node_idx = self.push_leaf(&mut active_leafs, &mut workspace.leaf_indices, &workspace.all_indices, left_histograms, left_start, left_len, leaf.depth + 1, p, pool);
+            let right_node_idx = self.push_leaf(&mut active_leafs, &mut workspace.leaf_indices, &workspace.all_indices, right_histograms, right_start, right_len, leaf.depth + 1, p, pool);
 
             let parent = &mut self.nodes[leaf.leaf_index];
             parent.is_leaf = false;
@@ -125,12 +147,11 @@ impl Tree {
         }
 
         for leaf in active_leafs {
-            for &row in &all_indices[leaf.start..leaf.start + leaf.len] {
-                leaf_indices[row as usize] = leaf.leaf_index as u32;
+            for &row in &workspace.all_indices[leaf.start..leaf.start + leaf.len] {
+                workspace.leaf_indices[row as usize] = leaf.leaf_index as u32;
             }
         }
 
-        leaf_indices
     }
 
     /// Zero-allocation, lock-free evaluation of a single row. For speed.
@@ -176,7 +197,8 @@ impl Tree {
         start: usize,
         len: usize,
         depth: usize,
-        p: &Parameters,
+        p: &BoosterParameters,
+        pool: Option<&rayon::ThreadPool>,
     ) -> usize {
         // This returns 0 if there's no features.
         let end = histograms.offsets.get(1).copied().unwrap_or(histograms.bins.len());
@@ -195,7 +217,7 @@ impl Tree {
         let best_split = if depth >= p.max_depth || hessian < p.min_sum_hessian_in_leaf * 2.0 {
             None
         } else {
-            histograms.find_best_split(gradient, hessian, score, p)
+            histograms.find_best_split(gradient, hessian, score, p, pool)
         };
 
         match best_split {

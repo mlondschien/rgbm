@@ -2,7 +2,7 @@
 
 use rayon::prelude::*;
 use crate::dataset::FeatureBundle;
-use crate::parameters::Parameters;
+use crate::parameters::BoosterParameters;
 
 #[derive(Clone, Default, Debug)]
 #[repr(C)]  // group fields into 16 bytes for optimal SIMD processing
@@ -225,19 +225,19 @@ impl Histograms {
             remaining_bins = rest;
         }
 
-        // For very small datasets, the overhead of parallelism isn't worth it
-        if indices.len() <= 4096 || pool.is_none() {
-            for (bundle, local_bins) in bundles.iter().zip(bin_slices) {
-                Self::build_into(bundle, grad_hess, indices, local_bins);
+        match pool {
+            None => {
+                for (bundle, local_bins) in bundles.iter().zip(bin_slices) {
+                    Self::build_into(bundle, grad_hess, indices, local_bins);
+                }
             }
-        } else {
-            pool.unwrap().install(|| {
+            Some(pool) => pool.install(|| {
                 bundles.par_iter()
                     .zip(bin_slices)
                     .for_each(|(bundle, local_bins)| {
                         Self::build_into(bundle, grad_hess, indices, local_bins);
                     });
-            });
+            }),
         }
 
         hists
@@ -259,7 +259,7 @@ impl Histograms {
         total_gradient: f64,
         total_hessian: f64,
         parent_score: f64,
-        parameters: &Parameters,
+        parameters: &BoosterParameters,
     ) -> Option<SplitInfo> {
         let sentinel_bin = &bins.last().unwrap();
 
@@ -349,7 +349,7 @@ impl Histograms {
         total_gradient: f64,
         total_hessian: f64,
         parent_score: f64,
-        parameters: &Parameters,
+        parameters: &BoosterParameters,
     ) -> Option<SplitInfo> {
         let num_bins = bins.len();
 
@@ -414,20 +414,24 @@ impl Histograms {
         })
     }
 
-    pub fn find_best_split(&self, total_gradient: f64, total_hessian: f64, parent_score: f64, p: &Parameters) -> Option<SplitInfo> {
-        (0..self.is_categorical.len())
-            .into_par_iter()
-            .filter_map(|f| {
-                let start = self.offsets[f];
-                let end = self.offsets[f+1];
-                let split_opt = if self.is_categorical[f] {
-                    Self::find_best_categorical_split(&self.bins[start..end], total_gradient, total_hessian, parent_score, p)
-                } else {
-                    Self::find_best_numeric_split(&self.bins[start..end], total_gradient, total_hessian, parent_score, p)
-                };
-                split_opt.map(|mut s| { s.feature_index = f; s })
-            })
-            .reduce_with(|a, b| if a.gain >= b.gain { a } else { b })
+    pub fn find_best_split(&self, total_gradient: f64, total_hessian: f64, parent_score: f64, p: &BoosterParameters, pool: Option<&rayon::ThreadPool>) -> Option<SplitInfo> {
+        let num_features = self.is_categorical.len();
+        let map_function = |f: usize| {
+            let bins = &self.bins[self.offsets[f]..self.offsets[f + 1]];
+            let split_opt = if self.is_categorical[f] {
+                Self::find_best_categorical_split(bins, total_gradient, total_hessian, parent_score, p)
+            } else {
+                Self::find_best_numeric_split(bins, total_gradient, total_hessian, parent_score, p)
+            };
+            split_opt.map(|mut s| { s.feature_index = f; s })
+        };
+        let reduce_function = |a: SplitInfo, b: SplitInfo| if a.gain >= b.gain { a } else { b };
+        match pool {
+            Some(pool) => pool.install(|| {
+                (0..num_features).into_par_iter().filter_map(map_function).reduce_with(reduce_function)
+            }),
+            None => (0..num_features).filter_map(map_function).reduce(reduce_function),
+        }
     }
 }
 
@@ -452,7 +456,7 @@ fn evaluate_split(
     right_hessian: f64,
     missing_goes_left: bool,
     threshold_idx: usize,
-    parameters: &Parameters,
+    parameters: &BoosterParameters,
     best_score: &mut f64,
     best_threshold: &mut usize,
     best_missing_goes_left: &mut bool,

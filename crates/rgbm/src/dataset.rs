@@ -1,6 +1,9 @@
 use arrow::array::{Float64Array, RecordBatch};
+use rayon::prelude::*;
 
 use crate::bin::FeatureBinner;
+use crate::parameters::DatasetParameters;
+use crate::utils::build_thread_pool;
 
 /// FeatureBundle stores the features' bin indices.
 /// Bin values are u8. We pack up to 4 of these into a single u32 (1 byte).
@@ -41,37 +44,53 @@ pub struct Dataset {
 
 impl Dataset {
     /// Build a `Dataset` from an Arrow `RecordBatch` of features plus separate label/weight arrays.
+    /// Todo: Handle weights.
     pub fn from_arrow(
         features: &RecordBatch,
         labels: &Float64Array,
         weights: Option<&Float64Array>,
-        max_bin: usize,
-        min_data_in_bin: usize,
+        params: &DatasetParameters,
     ) -> Self {
         let num_features = features.num_columns();
-        let mut feature_binners = Vec::with_capacity(num_features);
-        let mut feature_names = Vec::with_capacity(num_features);
-        let mut all_bins: Vec<Vec<u8>> = Vec::with_capacity(num_features);
-
-        // build feature_binners and create binned feature columns [u8].
-        for (field, array) in features.schema().fields().iter().zip(features.columns()) {
-            feature_names.push(field.name().clone());
-            let binner = FeatureBinner::new(array.as_ref(), max_bin, min_data_in_bin);
-            all_bins.push(binner.apply(array.as_ref()));
-            feature_binners.push(binner);
-        }
-
         let num_rows = features.num_rows();
-        let feature_bundles: Vec<FeatureBundle> = feature_binners.chunks(4)
-            .zip(all_bins.chunks(4))
-            .enumerate()
-            .map(|(chunk_idx, (chunk_binners, chunk_bins))| {
-                let start = chunk_idx * 4;
-                let feature_indices = (start..start + chunk_binners.len()).collect();
-                
-                FeatureBundle::pack(chunk_binners, chunk_bins, feature_indices, num_rows)
-            })
+
+        let feature_names: Vec<String> = features.schema().fields().iter()
+            .map(|f| f.name().clone())
             .collect();
+
+        let pool = build_thread_pool(params.n_jobs);
+
+        let (feature_binners, all_bins): (Vec<_>, Vec<_>) = match &pool {
+            Some(pool) => pool.install(|| {
+                features.columns().par_iter().map(|array| {
+                    let binner = FeatureBinner::new(array.as_ref(), params.max_bin, params.min_data_in_bin);
+                    let bins = binner.apply(array.as_ref());
+                    (binner, bins)
+                }).unzip()
+            }),
+            None => features.columns().iter().map(|array| {
+                let binner = FeatureBinner::new(array.as_ref(), params.max_bin, params.min_data_in_bin);
+                let bins = binner.apply(array.as_ref());
+                (binner, bins)
+            }).unzip(),
+        };
+
+        // Pack features into bundles of 4
+        let num_chunks = num_features.div_ceil(4);
+        let feature_bundles: Vec<FeatureBundle> = match &pool {
+            Some(pool) => pool.install(|| {
+                (0..num_chunks).into_par_iter().map(|chunk_idx| {
+                    let start = chunk_idx * 4;
+                    let end = (start + 4).min(num_features);
+                    FeatureBundle::pack(&feature_binners[start..end], &all_bins[start..end], (start..end).collect(), num_rows)
+                }).collect()
+            }),
+            None => (0..num_chunks).map(|chunk_idx| {
+                let start = chunk_idx * 4;
+                let end = (start + 4).min(num_features);
+                FeatureBundle::pack(&feature_binners[start..end], &all_bins[start..end], (start..end).collect(), num_rows)
+            }).collect(),
+        };
 
         Self {
             feature_binners,
@@ -104,7 +123,8 @@ mod tests {
     #[test]
     fn test_basic_dataset() {
         let labels = Float64Array::from(vec![0.0, 1.0, 0.0, 1.0, 0.0]);
-        let ds = Dataset::from_arrow(&make_features(), &labels, None, 255, 1);
+        let params = DatasetParameters { min_data_in_bin: 1, ..DatasetParameters::default() };
+        let ds = Dataset::from_arrow(&make_features(), &labels, None, &params);
         assert_eq!(ds.num_rows, 5);
         assert_eq!(ds.num_features, 1);
         assert_eq!(ds.feature_names, vec!["x"]);
@@ -125,7 +145,8 @@ mod tests {
         let features = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(dict)]).unwrap();
         let labels = Float64Array::from(vec![0.0, 1.0, 0.0, 1.0, 0.0]);
 
-        let ds = Dataset::from_arrow(&features, &labels, None, 255, 1);
+        let params = DatasetParameters { min_data_in_bin: 1, ..DatasetParameters::default() };
+        let ds = Dataset::from_arrow(&features, &labels, None, &params);
         assert_eq!(ds.num_features, 1);
         assert!(matches!(ds.feature_binners[0], FeatureBinner::Categorical(_)));
         assert_eq!(ds.feature_binners[0].num_bins(), 4); // 3 categories + sentinel

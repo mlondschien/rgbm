@@ -1,16 +1,17 @@
 use arrow::array::{Float64Array, PrimitiveArray};
 use arrow::datatypes::Float64Type;
 use arrow::record_batch::RecordBatch;
-use rayon;
+use rayon::prelude::*;
 
 use crate::bin::FeatureBinner;
 use crate::dataset::Dataset;
-use crate::parameters::Parameters;
+use crate::parameters::{BoosterParameters, DatasetParameters};
 use crate::objective::Objective;
-use crate::tree::Tree;
+use crate::tree::{Tree, TreeWorkspace};
+use crate::utils::build_thread_pool;
 
 pub struct Booster {
-    pub parameters: Parameters,
+    pub parameters: BoosterParameters,
     pub objective: Box<dyn Objective>,
     pub trees: Vec<Tree>,
     pub base_score: f64,
@@ -18,7 +19,7 @@ pub struct Booster {
 }
 
 impl Booster {
-    pub fn new(parameters: Parameters, objective: Box<dyn Objective>) -> Self {
+    pub fn new(parameters: BoosterParameters, objective: Box<dyn Objective>) -> Self {
         Self {
             parameters,
             objective,
@@ -35,27 +36,32 @@ impl Booster {
 
         let mut scores = vec![self.base_score; dataset.num_rows];
         let mut grad_hess = vec![[0.0f32; 2]; dataset.num_rows];
+        let mut workspace = TreeWorkspace::new(dataset.num_rows);
 
-        let n_threads = match self.parameters.n_jobs {
-            n if n <= 0 => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
-            n => n as usize,
-        };
-        let pool = if n_threads > 1 {
-            Some(rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap())
-        } else {
-            None
-        };
+        let pool = build_thread_pool(self.parameters.n_jobs);
 
         self.trees.clear();
 
         for _ in 0..self.parameters.num_iterations {
-            self.objective.gradient_hessian(labels, &scores, &mut grad_hess);
+            self.objective.gradient_hessian(labels, &scores, &mut grad_hess, pool.as_ref());
 
             let mut tree = Tree::new(self.parameters.max_leaves);
-            let leaf_indices = tree.fit(dataset, &grad_hess, &self.parameters, pool.as_ref());
+            tree.fit(dataset, &grad_hess, &self.parameters, pool.as_ref(), &mut workspace);
 
-            for (score, &leaf_idx) in scores.iter_mut().zip(&leaf_indices) {
-                *score += tree.nodes[leaf_idx as usize].value;
+            match &pool {
+                Some(pool) => {
+                    let nodes = &tree.nodes;
+                    pool.install(|| {
+                        scores.par_iter_mut().zip(workspace.leaf_indices.par_iter()).for_each(|(score, &leaf_idx)| {
+                            *score += nodes[leaf_idx as usize].value;
+                        });
+                    });
+                }
+                None => {
+                    for (score, &leaf_idx) in scores.iter_mut().zip(&workspace.leaf_indices) {
+                        *score += tree.nodes[leaf_idx as usize].value;
+                    }
+                }
             }
 
             self.trees.push(tree);
@@ -76,9 +82,22 @@ impl Booster {
 
         let num_rows = batch.num_rows();
         let mut scores = vec![self.base_score; num_rows];
-        for (row, score) in scores.iter_mut().enumerate() {
-            for tree in &self.trees {
-                *score += tree.predict_row(row, &numeric_columns, &categorical_columns);
+
+        let pool = build_thread_pool(self.parameters.n_jobs);
+        match &pool {
+            Some(pool) => pool.install(|| {
+                scores.par_iter_mut().enumerate().for_each(|(row, score)| {
+                    for tree in &self.trees {
+                        *score += tree.predict_row(row, &numeric_columns, &categorical_columns);
+                    }
+                });
+            }),
+            None => {
+                for (row, score) in scores.iter_mut().enumerate() {
+                    for tree in &self.trees {
+                        *score += tree.predict_row(row, &numeric_columns, &categorical_columns);
+                    }
+                }
             }
         }
 
@@ -94,18 +113,18 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use crate::dataset::Dataset;
     use crate::objective::{BinaryLogloss, Probit, SquaredLoss};
-    use crate::parameters::Parameters;
+    use crate::parameters::{BoosterParameters, DatasetParameters};
 
     fn make_dataset(x: Vec<f64>, y: Vec<f64>) -> (Dataset, RecordBatch) {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(x))]).unwrap();
         let labels = Float64Array::from(y);
-        let dataset = Dataset::from_arrow(&batch, &labels, None, 255, 1);
+        let dataset = Dataset::from_arrow(&batch, &labels, None, &DatasetParameters { min_data_in_bin: 1, ..DatasetParameters::default() });
         (dataset, batch)
     }
 
-    fn test_params() -> Parameters {
-        Parameters { num_iterations: 20, min_sum_hessian_in_leaf: 0.0, ..Parameters::default() }
+    fn test_params() -> BoosterParameters {
+        BoosterParameters { num_iterations: 20, min_sum_hessian_in_leaf: 0.0, ..BoosterParameters::default() }
     }
 
     fn mse(preds: &Float64Array, labels: &[f64]) -> f64 {
@@ -116,7 +135,7 @@ mod tests {
     fn test_base_score_is_mean() {
         let y = vec![0.0, 1.0, 2.0, 3.0];
         let (dataset, _) = make_dataset(vec![0.0, 1.0, 2.0, 3.0], y.clone());
-        let mut booster = Booster::new(Parameters { num_iterations: 0, ..test_params() }, Box::new(SquaredLoss));
+        let mut booster = Booster::new(BoosterParameters { num_iterations: 0, ..test_params() }, Box::new(SquaredLoss));
         booster.fit(&dataset);
         assert!((booster.base_score - 1.5).abs() < 1e-10);
     }

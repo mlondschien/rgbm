@@ -7,15 +7,39 @@ use pyo3::prelude::*;
 use ::rgbm::booster::Booster;
 use ::rgbm::dataset::Dataset;
 use ::rgbm::objective::{BinaryLogloss, Objective, Probit, SquaredLoss};
-use ::rgbm::parameters::Parameters;
+use ::rgbm::parameters::{BoosterParameters, DatasetParameters};
 
-#[pyclass]
-struct GradientBooster {
+#[pyclass(name = "Dataset")]
+struct PyDataset {
+    inner: Dataset,
+}
+
+#[pymethods]
+impl PyDataset {
+    #[new]
+    #[pyo3(signature = (x, y, max_bin=255, min_data_in_bin=3, n_jobs=-1))]
+    fn new(
+        x: &Bound<'_, PyAny>,
+        y: &Bound<'_, PyAny>,
+        max_bin: usize,
+        min_data_in_bin: usize,
+        n_jobs: isize,
+    ) -> PyResult<Self> {
+        let batch = RecordBatch::from_pyarrow_bound(x)?;
+        let labels = Float64Array::from(ArrayData::from_pyarrow_bound(y)?);
+        let params = DatasetParameters { max_bin, min_data_in_bin, n_jobs };
+        let inner = Dataset::from_arrow(&batch, &labels, None, &params);
+        Ok(Self { inner })
+    }
+}
+
+#[pyclass(name = "Booster")]
+struct PyBooster {
     booster: Booster,
 }
 
 #[pymethods]
-impl GradientBooster {
+impl PyBooster {
     #[new]
     #[pyo3(signature = (
         objective = "squared_loss",
@@ -25,8 +49,6 @@ impl GradientBooster {
         min_sum_hessian_in_leaf = 1e-3,
         lambda_l1 = 0.0,
         lambda_l2 = 0.0,
-        max_bin = 255,
-        min_data_in_bin = 3,
         max_leaves = 31,
         leaf_wise = true,
         n_jobs = -1,
@@ -39,8 +61,6 @@ impl GradientBooster {
         min_sum_hessian_in_leaf: f64,
         lambda_l1: f64,
         lambda_l2: f64,
-        max_bin: usize,
-        min_data_in_bin: usize,
         max_leaves: usize,
         leaf_wise: bool,
         n_jobs: isize,
@@ -55,20 +75,16 @@ impl GradientBooster {
         };
 
         Ok(Self {
-            booster: Booster::new(Parameters {
+            booster: Booster::new(BoosterParameters {
                 num_iterations, learning_rate, max_depth,
                 min_sum_hessian_in_leaf,
-                lambda_l1, lambda_l2, max_bin, min_data_in_bin, max_leaves, leaf_wise, n_jobs,
+                lambda_l1, lambda_l2, max_leaves, leaf_wise, n_jobs,
             }, obj),
         })
     }
 
-    fn fit(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, y: &Bound<'_, PyAny>) -> PyResult<()> {
-        let batch = RecordBatch::from_pyarrow_bound(x)?;
-        let labels = Float64Array::from(ArrayData::from_pyarrow_bound(y)?);
-        let p = &self.booster.parameters;
-        let dataset = Dataset::from_arrow(&batch, &labels, None, p.max_bin, p.min_data_in_bin);
-        py.allow_threads(|| self.booster.fit(&dataset));
+    fn fit(&mut self, py: Python<'_>, dataset: &PyDataset) -> PyResult<()> {
+        py.allow_threads(|| self.booster.fit(&dataset.inner));
         Ok(())
     }
 
@@ -81,6 +97,7 @@ impl GradientBooster {
 
 #[pymodule]
 fn rgbm(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<GradientBooster>()?;
+    m.add_class::<PyDataset>()?;
+    m.add_class::<PyBooster>()?;
     Ok(())
 }
