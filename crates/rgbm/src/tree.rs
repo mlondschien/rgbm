@@ -6,6 +6,7 @@ use crate::dataset::Dataset;
 use crate::histogram::{Histograms, SplitInfo, Threshold};
 use crate::parameters::BoosterParameters;
 use crate::histogram::calculate_score;
+use crate::utils::prefetch;
 
 /// Reusable scratch buffers for tree fitting, owned by the Booster and passed in each
 /// iteration to avoid repeated allocation of O(num_rows) memory.
@@ -13,8 +14,6 @@ pub struct TreeWorkspace {
     pub leaf_indices: Vec<u32>,
     left_buffer: Vec<u32>,
     right_buffer: Vec<u32>,
-    gh_left_buffer: Vec<[f32; 2]>,
-    gh_right_buffer: Vec<[f32; 2]>,
     all_indices: Vec<u32>,
     ordered_gh: Vec<[f32; 2]>,
 }
@@ -25,8 +24,6 @@ impl TreeWorkspace {
             leaf_indices: vec![0u32; num_rows],
             left_buffer: vec![0u32; num_rows],
             right_buffer: vec![0u32; num_rows],
-            gh_left_buffer: vec![[0.0f32; 2]; num_rows],
-            gh_right_buffer: vec![[0.0f32; 2]; num_rows],
             all_indices: (0..num_rows as u32).collect(),
             ordered_gh: vec![[0.0f32; 2]; num_rows],
         }
@@ -90,13 +87,11 @@ impl Tree {
     pub fn fit(&mut self, dataset: &Dataset, grad_hess: &[[f32; 2]], p: &BoosterParameters, pool: Option<&rayon::ThreadPool>, workspace: &mut TreeWorkspace) {
         self.nodes.clear();
 
-        // Reset workspace for this tree: restore identity index order and copy grad_hess.
         for (i, x) in workspace.all_indices.iter_mut().enumerate() { *x = i as u32; }
-        workspace.ordered_gh.copy_from_slice(grad_hess);
 
         let mut active_leafs: Vec<ActiveLeaf> = Vec::new();
 
-        let root_histograms = Histograms::build(&dataset.feature_bundles, &workspace.ordered_gh, &workspace.all_indices, pool);
+        let root_histograms = Histograms::build(&dataset.feature_bundles, grad_hess, &workspace.all_indices, pool);
 
         self.push_leaf(&mut active_leafs, &mut workspace.leaf_indices, &workspace.all_indices, root_histograms, 0, dataset.num_rows, 0, p, pool);
         let mut num_leaves = 1;
@@ -109,9 +104,7 @@ impl Tree {
 
             let split_position = self.partition_indices(
                 dataset, &mut workspace.all_indices[leaf.start..leaf.start + leaf.len],
-                &mut workspace.ordered_gh[leaf.start..leaf.start + leaf.len],
-                &leaf.best_split, &mut workspace.left_buffer, &mut workspace.right_buffer,
-                &mut workspace.gh_left_buffer, &mut workspace.gh_right_buffer);
+                &leaf.best_split, &mut workspace.left_buffer, &mut workspace.right_buffer);
 
             let left_start = leaf.start;
             let left_len = split_position;
@@ -121,11 +114,17 @@ impl Tree {
             // Build the smaller child directly, derive the larger by subtracting
             let (mut left_histograms, mut right_histograms);
             if left_len < right_len {
-                left_histograms = Histograms::build(&dataset.feature_bundles, &workspace.ordered_gh[left_start..left_start + left_len], &workspace.all_indices[left_start..left_start + left_len], pool);
+                let left_indices = &workspace.all_indices[left_start..left_start + left_len];
+                let ordered_grad_hess = &mut workspace.ordered_gh[..left_len];
+                gather_gradients(left_indices, grad_hess, ordered_grad_hess);
+                left_histograms = Histograms::build(&dataset.feature_bundles, ordered_grad_hess, left_indices, pool);
                 right_histograms = leaf.histograms;
                 right_histograms.subtract(&left_histograms);
             } else {
-                right_histograms = Histograms::build(&dataset.feature_bundles, &workspace.ordered_gh[right_start..right_start + right_len], &workspace.all_indices[right_start..right_start + right_len], pool);
+                let right_indices = &workspace.all_indices[right_start..right_start + right_len];
+                let ordered_grad_hess = &mut workspace.ordered_gh[..right_len];
+                gather_gradients(right_indices, grad_hess, ordered_grad_hess);
+                right_histograms = Histograms::build(&dataset.feature_bundles, ordered_grad_hess, right_indices, pool);
                 left_histograms = leaf.histograms;
                 left_histograms.subtract(&right_histograms);
             }
@@ -151,7 +150,6 @@ impl Tree {
                 workspace.leaf_indices[row as usize] = leaf.leaf_index as u32;
             }
         }
-
     }
 
     /// Zero-allocation, lock-free evaluation of a single row. For speed.
@@ -231,8 +229,14 @@ impl Tree {
         node_idx
     }
 
-
-    fn partition_indices(&self, dataset: &Dataset, indices: &mut [u32], ordered_gh: &mut [[f32; 2]], split: &SplitInfo, left_buffer: &mut [u32], right_buffer: &mut [u32], gh_left_buffer: &mut [[f32; 2]], gh_right_buffer: &mut [[f32; 2]]) -> usize {
+    pub fn partition_indices(
+        &self,
+        dataset: &Dataset,
+        indices: &mut [u32],
+        split: &SplitInfo,
+        left_buffer: &mut [u32],
+        right_buffer: &mut [u32],
+    ) -> usize {
         let bundle_idx = split.feature_index / 4;
         let shift = (split.feature_index % 4) * 8;
         let packed_bins = &dataset.feature_bundles[bundle_idx].packed_bins;
@@ -240,49 +244,124 @@ impl Tree {
         let sentinel = (dataset.feature_binners[split.feature_index].num_bins() - 1) as u8;
 
         let missing = split.missing_goes_left as usize;
+
+        const PREFETCH_DIST: usize = 16;
+        let n = indices.len();
+        let mid = n.saturating_sub(PREFETCH_DIST);
+
         let mut left_count = 0usize;
         let mut right_count = 0usize;
+
+        // Cache the raw pointer to bypass slice reference overhead
+        let pb_ptr = packed_bins.as_ptr();
 
         match &split.threshold {
             Threshold::Numeric(t) => {
                 let t = *t as u8;
-                for (&row, &gh) in indices.iter().zip(ordered_gh.iter()) {
-                    let bin = ((packed_bins[row as usize] >> shift) & 0xFF) as u8;
-                    let goes_left = if bin == sentinel { missing } else { (bin <= t) as usize };
-                    left_buffer[left_count] = row;
-                    gh_left_buffer[left_count] = gh;
-                    right_buffer[right_count] = row;
-                    gh_right_buffer[right_count] = gh;
-                    left_count += goes_left;
-                    right_count += 1 - goes_left;
+                for i in 0..mid {
+                    unsafe {
+                        let prefetch_index = *indices.get_unchecked(i + PREFETCH_DIST) as usize;
+                        prefetch(pb_ptr.add(prefetch_index  as usize));
+
+                        let index = *indices.get_unchecked(i);
+                        let bin = ((*pb_ptr.add(index as usize) >> shift) & 0xFF) as u8;
+                        // branchless calculation
+                        let goes_left = if bin == sentinel { missing } else { (bin <= t) as usize };
+
+                        *left_buffer.get_unchecked_mut(left_count) = index;
+                        *right_buffer.get_unchecked_mut(right_count) = index;
+
+                        left_count += goes_left;
+                        right_count += 1 - goes_left;
+                    }
+                }
+                for i in mid..n {
+                    unsafe {
+                        let index = *indices.get_unchecked(i);
+                        let bin = ((*pb_ptr.add(index as usize) >> shift) & 0xFF) as u8;
+                        let goes_left = if bin == sentinel { missing } else { (bin <= t) as usize };
+
+                        *left_buffer.get_unchecked_mut(left_count) = index;
+                        *right_buffer.get_unchecked_mut(right_count) = index;
+
+                        left_count += goes_left;
+                        right_count += 1 - goes_left;
+                    }
                 }
             }
             Threshold::Categorical(cats) => {
-                for (&row, &gh) in indices.iter().zip(ordered_gh.iter()) {
-                    let bin = ((packed_bins[row as usize] >> shift) & 0xFF) as usize;
-                    let goes_left = if bin == sentinel as usize { missing } else { cats[bin] as usize };
-                    left_buffer[left_count] = row;
-                    gh_left_buffer[left_count] = gh;
-                    right_buffer[right_count] = row;
-                    gh_right_buffer[right_count] = gh;
-                    left_count += goes_left;
-                    right_count += 1 - goes_left;
+                for i in 0..mid {
+                    unsafe {
+                        let ahead_row = *indices.get_unchecked(i + PREFETCH_DIST) as usize;
+                        prefetch(pb_ptr.add(ahead_row));
+
+                        let row = *indices.get_unchecked(i);
+                        let bin = ((*pb_ptr.add(row as usize) >> shift) & 0xFF) as usize;
+                        
+                        let goes_left = if bin == sentinel as usize { missing } else { *cats.get_unchecked(bin) as usize };
+
+                        *left_buffer.get_unchecked_mut(left_count) = row;
+                        *right_buffer.get_unchecked_mut(right_count) = row;
+
+                        left_count += goes_left;
+                        right_count += 1 - goes_left;
+                    }
+                }
+                for i in mid..n {
+                    unsafe {
+                        let row = *indices.get_unchecked(i);
+                        let bin = ((*pb_ptr.add(row as usize) >> shift) & 0xFF) as usize;
+                        let goes_left = if bin == sentinel as usize { missing } else { *cats.get_unchecked(bin) as usize };
+
+                        *left_buffer.get_unchecked_mut(left_count) = row;
+                        *right_buffer.get_unchecked_mut(right_count) = row;
+
+                        left_count += goes_left;
+                        right_count += 1 - goes_left;
+                    }
                 }
             }
         }
 
         indices[..left_count].copy_from_slice(&left_buffer[..left_count]);
         indices[left_count..].copy_from_slice(&right_buffer[..right_count]);
-        ordered_gh[..left_count].copy_from_slice(&gh_left_buffer[..left_count]);
-        ordered_gh[left_count..].copy_from_slice(&gh_right_buffer[..right_count]);
+
         left_count
+    }
+}
+
+/// Gather `grad_hess[indices[i]]` into `out[i]` for `i` in `indices`.
+#[inline(always)]
+fn gather_gradients(indices: &[u32], grad_hess: &[[f32; 2]], out: &mut [[f32; 2]]) {
+    const PREFETCH_DIST: usize = 16;
+    let n = indices.len();
+    let mid = n.saturating_sub(PREFETCH_DIST);
+    let gh_ptr = grad_hess.as_ptr();
+
+    for i in 0..mid {
+        unsafe {
+            let prefetch_index = *indices.get_unchecked(i + PREFETCH_DIST) as usize;
+            prefetch(gh_ptr.add(prefetch_index));
+            let index = *indices.get_unchecked(i) as usize;
+            *out.get_unchecked_mut(i) = *gh_ptr.add(index);
+        }
+    }
+    for i in mid..n {
+        unsafe {
+            let index = *indices.get_unchecked(i) as usize;
+            *out.get_unchecked_mut(i) = *gh_ptr.add(index);
+        }
     }
 }
 
 #[inline(always)]
 pub fn calculate_value(g: f64, h: f64, l1: f64, l2: f64) -> f64 {
-    let d = (g.abs() - l1).max(0.0);
-    -g.signum() * d / (h + l2)
+    if l1 == 0.0 {
+        -g / (h + l2)
+    } else {
+        let d = (g.abs() - l1).max(0.0);
+        -g.signum() * d / (h + l2)
+    }
 }
 
 

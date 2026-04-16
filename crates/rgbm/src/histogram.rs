@@ -3,6 +3,7 @@
 use rayon::prelude::*;
 use crate::dataset::FeatureBundle;
 use crate::parameters::BoosterParameters;
+use crate::utils::prefetch;
 
 #[derive(Clone, Default, Debug)]
 #[repr(C)]  // group fields into 16 bytes for optimal SIMD processing
@@ -71,25 +72,28 @@ impl Histograms {
     pub fn build_into(bundle: &FeatureBundle, packed_gh: &[[f32; 2]], row_indices: &[u32], bins: &mut [HistogramBin]) {
         let p0 = bins.as_mut_ptr();
 
+        const PREFETCH_DIST: usize = 16;
+        // mid is even so the 2-way unrolled main loop has no remainder.
+        let mid = (row_indices.len().saturating_sub(PREFETCH_DIST) / 2) * 2;
+
         match bundle.count {
             4 => {
                 let p1 = unsafe { p0.add(bundle.num_bins[0]) };
                 let p2 = unsafe { p1.add(bundle.num_bins[1]) };
                 let p3 = unsafe { p2.add(bundle.num_bins[2]) };
 
-
-                // Use chunks_exact to guarantee chunk size and avoid bounds checks. We handle
-                // the possible leftover chunk below.
                 // with 2x unrolling and 4 features per chunk, data/pointers in one loop fit
                 // comfortably into modern CPU registers.
-                let mut row_chunks = row_indices.chunks_exact(2);
-                let mut gh_chunks = packed_gh.chunks_exact(2);
-                for (row_chunk, gh_chunk) in row_chunks.by_ref().zip(gh_chunks.by_ref()) {
-                    let row0 = row_chunk[0] as usize;
-                    let row1 = row_chunk[1] as usize;
+                // Use index `i` instead of `iter_chunks()` to avoid zip.
+                let mut i = 0;
+                while i < mid {
                     unsafe {
-                        let gh0 = *gh_chunk.get_unchecked(0);
-                        let gh1 = *gh_chunk.get_unchecked(1);
+                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST) as usize));
+                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST + 1) as usize));
+                        let row0 = *row_indices.get_unchecked(i) as usize;
+                        let row1 = *row_indices.get_unchecked(i + 1) as usize;
+                        let gh0 = *packed_gh.get_unchecked(i);
+                        let gh1 = *packed_gh.get_unchecked(i + 1);
                         let pk0 = *bundle.packed_bins.get_unchecked(row0);
                         let pk1 = *bundle.packed_bins.get_unchecked(row1);
 
@@ -103,14 +107,17 @@ impl Histograms {
                         (*p2.add(((pk1 >> 16) & 0xFF) as usize)).add(gh1);
                         (*p3.add((pk1 >> 24) as usize)).add(gh1);
                     }
+                    i += 2;
                 }
-                for (&row, gh) in row_chunks.remainder().iter().zip(gh_chunks.remainder()) {
+                for i in mid..row_indices.len() {
                     unsafe {
-                        let pk = *bundle.packed_bins.get_unchecked(row as usize);
-                        (*p0.add((pk & 0xFF) as usize)).add(*gh);
-                        (*p1.add(((pk >> 8) & 0xFF) as usize)).add(*gh);
-                        (*p2.add(((pk >> 16) & 0xFF) as usize)).add(*gh);
-                        (*p3.add((pk >> 24) as usize)).add(*gh);
+                        let row = *row_indices.get_unchecked(i) as usize;
+                        let gh = *packed_gh.get_unchecked(i);
+                        let pk = *bundle.packed_bins.get_unchecked(row);
+                        (*p0.add((pk & 0xFF) as usize)).add(gh);
+                        (*p1.add(((pk >> 8) & 0xFF) as usize)).add(gh);
+                        (*p2.add(((pk >> 16) & 0xFF) as usize)).add(gh);
+                        (*p3.add((pk >> 24) as usize)).add(gh);
                     }
                 }
             }
@@ -118,14 +125,15 @@ impl Histograms {
                 let p1 = unsafe { p0.add(bundle.num_bins[0]) };
                 let p2 = unsafe { p1.add(bundle.num_bins[1]) };
 
-                let mut row_chunks = row_indices.chunks_exact(2);
-                let mut gh_chunks = packed_gh.chunks_exact(2);
-                for (row_chunk, gh_chunk) in row_chunks.by_ref().zip(gh_chunks.by_ref()) {
-                    let row0 = row_chunk[0] as usize;
-                    let row1 = row_chunk[1] as usize;
+                let mut i = 0;
+                while i < mid {
                     unsafe {
-                        let gh0 = *gh_chunk.get_unchecked(0);
-                        let gh1 = *gh_chunk.get_unchecked(1);
+                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST) as usize));
+                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST + 1) as usize));
+                        let row0 = *row_indices.get_unchecked(i) as usize;
+                        let row1 = *row_indices.get_unchecked(i + 1) as usize;
+                        let gh0 = *packed_gh.get_unchecked(i);
+                        let gh1 = *packed_gh.get_unchecked(i + 1);
                         let pk0 = *bundle.packed_bins.get_unchecked(row0);
                         let pk1 = *bundle.packed_bins.get_unchecked(row1);
 
@@ -137,27 +145,31 @@ impl Histograms {
                         (*p1.add(((pk1 >> 8) & 0xFF) as usize)).add(gh1);
                         (*p2.add(((pk1 >> 16) & 0xFF) as usize)).add(gh1);
                     }
+                    i += 2;
                 }
-                for (&row, gh) in row_chunks.remainder().iter().zip(gh_chunks.remainder()) {
+                for i in mid..row_indices.len() {
                     unsafe {
-                        let pk = *bundle.packed_bins.get_unchecked(row as usize);
-                        (*p0.add((pk & 0xFF) as usize)).add(*gh);
-                        (*p1.add(((pk >> 8) & 0xFF) as usize)).add(*gh);
-                        (*p2.add(((pk >> 16) & 0xFF) as usize)).add(*gh);
+                        let row = *row_indices.get_unchecked(i) as usize;
+                        let gh = *packed_gh.get_unchecked(i);
+                        let pk = *bundle.packed_bins.get_unchecked(row);
+                        (*p0.add((pk & 0xFF) as usize)).add(gh);
+                        (*p1.add(((pk >> 8) & 0xFF) as usize)).add(gh);
+                        (*p2.add(((pk >> 16) & 0xFF) as usize)).add(gh);
                     }
                 }
             }
             2 => {
                 let p1 = unsafe { p0.add(bundle.num_bins[0]) };
 
-                let mut row_chunks = row_indices.chunks_exact(2);
-                let mut gh_chunks = packed_gh.chunks_exact(2);
-                for (row_chunk, gh_chunk) in row_chunks.by_ref().zip(gh_chunks.by_ref()) {
-                    let row0 = row_chunk[0] as usize;
-                    let row1 = row_chunk[1] as usize;
+                let mut i = 0;
+                while i < mid {
                     unsafe {
-                        let gh0 = *gh_chunk.get_unchecked(0);
-                        let gh1 = *gh_chunk.get_unchecked(1);
+                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST) as usize));
+                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST + 1) as usize));
+                        let row0 = *row_indices.get_unchecked(i) as usize;
+                        let row1 = *row_indices.get_unchecked(i + 1) as usize;
+                        let gh0 = *packed_gh.get_unchecked(i);
+                        let gh1 = *packed_gh.get_unchecked(i + 1);
                         let pk0 = *bundle.packed_bins.get_unchecked(row0);
                         let pk1 = *bundle.packed_bins.get_unchecked(row1);
 
@@ -167,35 +179,42 @@ impl Histograms {
                         (*p0.add((pk1 & 0xFF) as usize)).add(gh1);
                         (*p1.add(((pk1 >> 8) & 0xFF) as usize)).add(gh1);
                     }
+                    i += 2;
                 }
-                for (&row, gh) in row_chunks.remainder().iter().zip(gh_chunks.remainder()) {
+                for i in mid..row_indices.len() {
                     unsafe {
-                        let pk = *bundle.packed_bins.get_unchecked(row as usize);
-                        (*p0.add((pk & 0xFF) as usize)).add(*gh);
-                        (*p1.add(((pk >> 8) & 0xFF) as usize)).add(*gh);
+                        let row = *row_indices.get_unchecked(i) as usize;
+                        let gh = *packed_gh.get_unchecked(i);
+                        let pk = *bundle.packed_bins.get_unchecked(row);
+                        (*p0.add((pk & 0xFF) as usize)).add(gh);
+                        (*p1.add(((pk >> 8) & 0xFF) as usize)).add(gh);
                     }
                 }
             }
             1 => {
-                let mut row_chunks = row_indices.chunks_exact(2);
-                let mut gh_chunks = packed_gh.chunks_exact(2);
-                for (row_chunk, gh_chunk) in row_chunks.by_ref().zip(gh_chunks.by_ref()) {
-                    let row0 = row_chunk[0] as usize;
-                    let row1 = row_chunk[1] as usize;
+                let mut i = 0;
+                while i < mid {
                     unsafe {
-                        let gh0 = *gh_chunk.get_unchecked(0);
-                        let gh1 = *gh_chunk.get_unchecked(1);
+                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST) as usize));
+                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST + 1) as usize));
+                        let row0 = *row_indices.get_unchecked(i) as usize;
+                        let row1 = *row_indices.get_unchecked(i + 1) as usize;
+                        let gh0 = *packed_gh.get_unchecked(i);
+                        let gh1 = *packed_gh.get_unchecked(i + 1);
                         let pk0 = *bundle.packed_bins.get_unchecked(row0);
                         let pk1 = *bundle.packed_bins.get_unchecked(row1);
 
                         (*p0.add((pk0 & 0xFF) as usize)).add(gh0);
                         (*p0.add((pk1 & 0xFF) as usize)).add(gh1);
                     }
+                    i += 2;
                 }
-                for (&row, gh) in row_chunks.remainder().iter().zip(gh_chunks.remainder()) {
+                for i in mid..row_indices.len() {
                     unsafe {
-                        let pk = *bundle.packed_bins.get_unchecked(row as usize);
-                        (*p0.add((pk & 0xFF) as usize)).add(*gh);
+                        let row = *row_indices.get_unchecked(i) as usize;
+                        let gh = *packed_gh.get_unchecked(i);
+                        let pk = *bundle.packed_bins.get_unchecked(row);
+                        (*p0.add((pk & 0xFF) as usize)).add(gh);
                     }
                 }
             }

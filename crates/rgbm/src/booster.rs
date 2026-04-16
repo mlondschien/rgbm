@@ -5,7 +5,7 @@ use rayon::prelude::*;
 
 use crate::bin::FeatureBinner;
 use crate::dataset::Dataset;
-use crate::parameters::{BoosterParameters, DatasetParameters};
+use crate::parameters::BoosterParameters;
 use crate::objective::Objective;
 use crate::tree::{Tree, TreeWorkspace};
 use crate::utils::build_thread_pool;
