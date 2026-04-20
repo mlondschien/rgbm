@@ -21,7 +21,7 @@ impl HistogramBin {
 }
 
 #[derive(Clone, Debug)]
-pub enum Threshold {
+pub enum BinSplit {
     Numeric(u32),
     Categorical(Vec<bool>),
 }
@@ -29,7 +29,7 @@ pub enum Threshold {
 pub struct SplitInfo {
     pub gain: f64,
     pub missing_goes_left: bool,
-    pub threshold: Threshold,
+    pub threshold: BinSplit,
     pub feature_index: usize,
 }
 
@@ -353,7 +353,7 @@ impl Histograms {
         Some(SplitInfo {
             gain: best_score - parent_score,
             missing_goes_left: best_missing_goes_left,
-            threshold: Threshold::Numeric(best_threshold as u32),
+            threshold: BinSplit::Numeric(best_threshold as u32),
             feature_index: 0, // to be filled in by caller
         })
     }
@@ -428,7 +428,7 @@ impl Histograms {
         Some(SplitInfo {
             gain: best_score - parent_score,
             missing_goes_left: best_missing_goes_left,
-            threshold: Threshold::Categorical(goes_left),
+            threshold: BinSplit::Categorical(goes_left),
             feature_index: 0, // to be filled in by caller
         })
     }

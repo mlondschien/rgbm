@@ -3,7 +3,7 @@ use arrow::datatypes::Float64Type;
 
 use crate::bin::FeatureBinner;
 use crate::dataset::Dataset;
-use crate::histogram::{Histograms, SplitInfo, Threshold};
+use crate::histogram::{BinSplit, Histograms, SplitInfo};
 use crate::parameters::BoosterParameters;
 use crate::histogram::calculate_score;
 use crate::utils::prefetch;
@@ -31,19 +31,27 @@ impl TreeWorkspace {
 }
 
 #[derive(Clone)]
-pub enum FinalThreshold {
+pub enum Threshold {
     Numeric(f64),
-    Categorical(Vec<bool>),
+    Categorical([u64; 4]),
 }
 
-impl FinalThreshold {
-    pub fn from_threshold(threshold: &Threshold, binner: &FeatureBinner) -> Self {
-        match threshold {
-            Threshold::Numeric(bin) => FinalThreshold::Numeric(match binner {
+impl Threshold {
+    pub fn from_bin_split(bin_split: &BinSplit, binner: &FeatureBinner) -> Self {
+        match bin_split {
+            BinSplit::Numeric(bin) => Threshold::Numeric(match binner {
                 FeatureBinner::Numerical(upper_bounds) => upper_bounds[*bin as usize],
                 FeatureBinner::Categorical(_) => panic!("numeric split on categorical feature"),
             }),
-            Threshold::Categorical(gl) => FinalThreshold::Categorical(gl.clone()),
+            BinSplit::Categorical(gl) => {
+                let mut bitset = [0u64; 4];
+                for (i, &goes_left) in gl.iter().enumerate() {
+                    if goes_left {
+                        bitset[i / 64] |= 1 << (i % 64);
+                    }
+                }
+                Threshold::Categorical(bitset)
+            }
         }
     }
 }
@@ -60,7 +68,7 @@ pub enum Node {
         right_child: u32,
         split_feature: u32,
         missing_goes_left: bool,
-        threshold: FinalThreshold,
+        threshold: Threshold,
     },
 }
 
@@ -148,7 +156,7 @@ impl Tree {
                 right_child: right_node_idx as u32,
                 split_feature: leaf.best_split.feature_index as u32,
                 missing_goes_left: leaf.best_split.missing_goes_left,
-                threshold: FinalThreshold::from_threshold(
+                threshold: Threshold::from_bin_split(
                     &leaf.best_split.threshold,
                     &dataset.feature_binners[leaf.best_split.feature_index],
                 ),
@@ -183,7 +191,7 @@ impl Tree {
                     threshold,
                 } => {
                     let goes_left = match threshold {
-                        FinalThreshold::Numeric(t) => {
+                        Threshold::Numeric(t) => {
                             let col = numeric_columns[*split_feature as usize].unwrap();
                             if col.is_null(row) {
                                 *missing_goes_left
@@ -192,10 +200,14 @@ impl Tree {
                                 if val.is_nan() { *missing_goes_left } else { val <= *t }
                             }
                         }
-                        FinalThreshold::Categorical(gl) => {
+                        Threshold::Categorical(bitset) => {
                             let col = categorical_columns[*split_feature as usize].as_ref().unwrap();
                             let bin = col[row] as usize;
-                            if bin < gl.len() { gl[bin] } else { *missing_goes_left }
+                            if bin < 256 {
+                                (bitset[bin / 64] >> (bin % 64)) & 1 == 1
+                            } else {
+                                *missing_goes_left
+                            }
                         }
                     };
                     idx = if goes_left { *left_child as usize } else { *right_child as usize };
@@ -270,7 +282,7 @@ impl Tree {
         let pb_ptr = packed_bins.as_ptr();
 
         match &split.threshold {
-            Threshold::Numeric(t) => {
+            BinSplit::Numeric(t) => {
                 let t = *t as u8;
                 for i in 0..mid {
                     unsafe {
@@ -303,7 +315,7 @@ impl Tree {
                     }
                 }
             }
-            Threshold::Categorical(cats) => {
+            BinSplit::Categorical(cats) => {
                 for i in 0..mid {
                     unsafe {
                         let ahead_row = *indices.get_unchecked(i + PREFETCH_DIST) as usize;
@@ -393,7 +405,7 @@ mod tests {
             left_child: left_child as u32,
             right_child: right_child as u32,
             split_feature: feature as u32,
-            threshold: FinalThreshold::Numeric(threshold),
+            threshold: Threshold::Numeric(threshold),
             missing_goes_left,
         }
     }
@@ -433,12 +445,15 @@ mod tests {
     #[test]
     fn test_predict_categorical() {
         // categories 0 and 2 go left, category 1 goes right
+        let mut bitset = [0u64; 4];
+        bitset[0] = (1 << 0) | (1 << 2);
+
         let tree = Tree { nodes: vec![
             Node::Internal {
                 left_child: 1,
                 right_child: 2,
                 split_feature: 0,
-                threshold: FinalThreshold::Categorical(vec![true, false, true]),
+                threshold: Threshold::Categorical(bitset),
                 missing_goes_left: false,
             },
             leaf(-1.0),
