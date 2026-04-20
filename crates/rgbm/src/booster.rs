@@ -53,13 +53,13 @@ impl Booster {
                     let nodes = &tree.nodes;
                     pool.install(|| {
                         scores.par_iter_mut().zip(workspace.leaf_indices.par_iter()).for_each(|(score, &leaf_idx)| {
-                            *score += nodes[leaf_idx as usize].value;
+                            *score += nodes[leaf_idx as usize].value();
                         });
                     });
                 }
                 None => {
                     for (score, &leaf_idx) in scores.iter_mut().zip(&workspace.leaf_indices) {
-                        *score += tree.nodes[leaf_idx as usize].value;
+                        *score += tree.nodes[leaf_idx as usize].value();
                     }
                 }
             }

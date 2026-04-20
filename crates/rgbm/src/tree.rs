@@ -49,18 +49,29 @@ impl FinalThreshold {
 }
 
 /// Node in the decision tree, stored after training.
-// why not use an enum: Leaf/Internal? I did this initially, but was told off by an LLM.
-// Apparently this way storing both leaf and internal fields together with an is_leaf
-// flag makes the predict much faster.
 #[derive(Clone)]
-pub struct Node {
-    pub is_leaf: bool,
-    pub left_child: usize,
-    pub right_child: usize,
-    pub split_feature: usize,
-    pub threshold: FinalThreshold,
-    pub missing_goes_left: bool,
-    pub value: f64,
+#[repr(u8)]
+pub enum Node {
+    Leaf {
+        value: f64,
+    },
+    Internal {
+        left_child: u32,
+        right_child: u32,
+        split_feature: u32,
+        missing_goes_left: bool,
+        threshold: FinalThreshold,
+    },
+}
+
+impl Node {
+    #[inline(always)]
+    pub fn value(&self) -> f64 {
+        match self {
+            Node::Leaf { value } => *value,
+            _ => panic!("called value() on an internal node"),
+        }
+    }
 }
 
 /// Leaf node during training. In leaf-first growth, we keep track of active leaves and
@@ -132,16 +143,16 @@ impl Tree {
             let left_node_idx = self.push_leaf(&mut active_leafs, &mut workspace.leaf_indices, &workspace.all_indices, left_histograms, left_start, left_len, leaf.depth + 1, p, pool);
             let right_node_idx = self.push_leaf(&mut active_leafs, &mut workspace.leaf_indices, &workspace.all_indices, right_histograms, right_start, right_len, leaf.depth + 1, p, pool);
 
-            let parent = &mut self.nodes[leaf.leaf_index];
-            parent.is_leaf = false;
-            parent.left_child = left_node_idx;
-            parent.right_child = right_node_idx;
-            parent.split_feature = leaf.best_split.feature_index;
-            parent.missing_goes_left = leaf.best_split.missing_goes_left;
-            parent.threshold = FinalThreshold::from_threshold(
-                &leaf.best_split.threshold,
-                &dataset.feature_binners[leaf.best_split.feature_index],
-            );
+            self.nodes[leaf.leaf_index] = Node::Internal {
+                left_child: left_node_idx as u32,
+                right_child: right_node_idx as u32,
+                split_feature: leaf.best_split.feature_index as u32,
+                missing_goes_left: leaf.best_split.missing_goes_left,
+                threshold: FinalThreshold::from_threshold(
+                    &leaf.best_split.threshold,
+                    &dataset.feature_binners[leaf.best_split.feature_index],
+                ),
+            };
             num_leaves += 1;
         }
 
@@ -162,27 +173,34 @@ impl Tree {
     ) -> f64 {
         let mut idx = 0;
         loop {
-            let node = &self.nodes[idx];
-            if node.is_leaf { return node.value; }
-
-            let goes_left = match &node.threshold {
-                FinalThreshold::Numeric(t) => {
-                    let col = numeric_columns[node.split_feature].unwrap();
-                    if col.is_null(row) {
-                        node.missing_goes_left
-                    } else {
-                        let val = col.value(row);
-                        if val.is_nan() { node.missing_goes_left } else { val <= *t }
-                    }
+            match unsafe { self.nodes.get_unchecked(idx) } {
+                Node::Leaf { value } => return *value,
+                Node::Internal {
+                    left_child,
+                    right_child,
+                    split_feature,
+                    missing_goes_left,
+                    threshold,
+                } => {
+                    let goes_left = match threshold {
+                        FinalThreshold::Numeric(t) => {
+                            let col = numeric_columns[*split_feature as usize].unwrap();
+                            if col.is_null(row) {
+                                *missing_goes_left
+                            } else {
+                                let val = col.value(row);
+                                if val.is_nan() { *missing_goes_left } else { val <= *t }
+                            }
+                        }
+                        FinalThreshold::Categorical(gl) => {
+                            let col = categorical_columns[*split_feature as usize].as_ref().unwrap();
+                            let bin = col[row] as usize;
+                            if bin < gl.len() { gl[bin] } else { *missing_goes_left }
+                        }
+                    };
+                    idx = if goes_left { *left_child as usize } else { *right_child as usize };
                 }
-                FinalThreshold::Categorical(gl) => {
-                    let col = categorical_columns[node.split_feature].as_ref().unwrap();
-                    let bin = col[row] as usize;
-                    if bin < gl.len() { gl[bin] } else { node.missing_goes_left }
-                }
-            };
-
-            idx = if goes_left { node.left_child } else { node.right_child };
+            }
         }
     }
 
@@ -206,11 +224,7 @@ impl Tree {
         let value = calculate_value(gradient, hessian, p.lambda_l1, p.lambda_l2) * p.learning_rate;
         let node_idx = self.nodes.len();
 
-        self.nodes.push(Node {
-            is_leaf: true, left_child: 0, right_child: 0, split_feature: 0,
-            threshold: FinalThreshold::Numeric(0.0), missing_goes_left: false,
-            value: value,
-        });
+        self.nodes.push(Node::Leaf { value });
 
         let best_split = if depth >= p.max_depth || hessian < p.min_sum_hessian_in_leaf * 2.0 {
             None
@@ -371,13 +385,17 @@ mod tests {
     use arrow::array::Float64Array;
 
     fn leaf(value: f64) -> Node {
-        Node { is_leaf: true, left_child: 0, right_child: 0, split_feature: 0,
-            threshold: FinalThreshold::Numeric(0.0), missing_goes_left: false, value }
+        Node::Leaf { value }
     }
 
     fn numeric_split(feature: usize, threshold: f64, left_child: usize, right_child: usize, missing_goes_left: bool) -> Node {
-        Node { is_leaf: false, left_child, right_child, split_feature: feature,
-            threshold: FinalThreshold::Numeric(threshold), missing_goes_left, value: 0.0 }
+        Node::Internal {
+            left_child: left_child as u32,
+            right_child: right_child as u32,
+            split_feature: feature as u32,
+            threshold: FinalThreshold::Numeric(threshold),
+            missing_goes_left,
+        }
     }
 
     fn predict(tree: &Tree, numeric: &[Option<Float64Array>], categorical: &[Option<Vec<u8>>], row: usize) -> f64 {
@@ -416,9 +434,13 @@ mod tests {
     fn test_predict_categorical() {
         // categories 0 and 2 go left, category 1 goes right
         let tree = Tree { nodes: vec![
-            Node { is_leaf: false, left_child: 1, right_child: 2, split_feature: 0,
+            Node::Internal {
+                left_child: 1,
+                right_child: 2,
+                split_feature: 0,
                 threshold: FinalThreshold::Categorical(vec![true, false, true]),
-                missing_goes_left: false, value: 0.0 },
+                missing_goes_left: false,
+            },
             leaf(-1.0),
             leaf(1.0),
         ]};
