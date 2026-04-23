@@ -1,5 +1,6 @@
 use arrow::array::{Array, PrimitiveArray};
 use arrow::datatypes::Float64Type;
+use rayon::prelude::*;
 
 use crate::bin::FeatureBinner;
 use crate::dataset::Dataset;
@@ -12,10 +13,11 @@ use crate::utils::prefetch;
 /// iteration to avoid repeated allocation of O(num_rows) memory.
 pub struct TreeWorkspace {
     pub leaf_indices: Vec<u32>,
-    left_buffer: Vec<u32>,
-    right_buffer: Vec<u32>,
-    all_indices: Vec<u32>,
-    ordered_gh: Vec<[f32; 2]>,
+    pub left_buffer: Vec<u32>,
+    pub right_buffer: Vec<u32>,
+    pub all_indices: Vec<u32>,
+    pub ordered_gh: Vec<[f32; 2]>,
+    pub partition_flags: Vec<bool>,
 }
 
 impl TreeWorkspace {
@@ -26,6 +28,7 @@ impl TreeWorkspace {
             right_buffer: vec![0u32; num_rows],
             all_indices: (0..num_rows as u32).collect(),
             ordered_gh: vec![[0.0f32; 2]; num_rows],
+            partition_flags: vec![false; num_rows],
         }
     }
 }
@@ -85,12 +88,12 @@ impl Node {
 /// Leaf node during training. In leaf-first growth, we keep track of active leaves and
 /// select the next leaf to split based on the best split gain.
 pub struct ActiveLeaf {
-    leaf_index: usize,
-    start: usize,
-    len: usize,
-    depth: usize,
-    histograms: Histograms,
-    best_split: SplitInfo,
+    pub leaf_index: usize,
+    pub start: usize,
+    pub len: usize,
+    pub depth: usize,
+    pub histograms: Histograms,
+    pub best_split: SplitInfo,
 }
 
 #[derive(Clone)]
@@ -123,7 +126,7 @@ impl Tree {
 
             let split_position = self.partition_indices(
                 dataset, &mut workspace.all_indices[leaf.start..leaf.start + leaf.len],
-                &leaf.best_split, &mut workspace.left_buffer, &mut workspace.right_buffer);
+                &leaf.best_split, &mut workspace.left_buffer, &mut workspace.right_buffer, pool, &mut workspace.partition_flags);
 
             let left_start = leaf.start;
             let left_len = split_position;
@@ -255,6 +258,10 @@ impl Tree {
         node_idx
     }
 
+    /// Separate `indices` into left/right based on split. Indices that belong left go
+    /// to the front of `indices`, those that belong right go to the back. Returns the
+    /// number of indices that go left. Uses buffers instead of in-place swapping to
+    /// scrambling the order of rows. That is, the indices are ordered within leafs.
     pub fn partition_indices(
         &self,
         dataset: &Dataset,
@@ -262,97 +269,107 @@ impl Tree {
         split: &SplitInfo,
         left_buffer: &mut [u32],
         right_buffer: &mut [u32],
+        pool: Option<&rayon::ThreadPool>,
+        flags: &mut [bool],
     ) -> usize {
-        let bundle_idx = split.feature_index / 4;
-        let shift = (split.feature_index % 4) * 8;
-        let packed_bins = &dataset.feature_bundles[bundle_idx].packed_bins;
-
-        let sentinel = (dataset.feature_binners[split.feature_index].num_bins() - 1) as u8;
-
-        let missing = split.missing_goes_left as usize;
-
-        const PREFETCH_DIST: usize = 16;
         let n = indices.len();
-        let mid = n.saturating_sub(PREFETCH_DIST);
+        let bundle = &dataset.feature_bundles[split.feature_index / 4];
+        let shift = (split.feature_index % 4) * 8;
+        let bins = &bundle.packed_bins;
+        let sentinel = (dataset.feature_binners[split.feature_index].num_bins() - 1) as u8;
+        let missing = split.missing_goes_left;
 
-        let mut left_count = 0usize;
-        let mut right_count = 0usize;
-
-        // Cache the raw pointer to bypass slice reference overhead
-        let pb_ptr = packed_bins.as_ptr();
-
-        match &split.threshold {
-            BinSplit::Numeric(t) => {
-                let t = *t as u8;
-                for i in 0..mid {
-                    unsafe {
-                        let prefetch_index = *indices.get_unchecked(i + PREFETCH_DIST) as usize;
-                        prefetch(pb_ptr.add(prefetch_index  as usize));
-
-                        let index = *indices.get_unchecked(i);
-                        let bin = ((*pb_ptr.add(index as usize) >> shift) & 0xFF) as u8;
-                        // branchless calculation
-                        let goes_left = if bin == sentinel { missing } else { (bin <= t) as usize };
-
-                        *left_buffer.get_unchecked_mut(left_count) = index;
-                        *right_buffer.get_unchecked_mut(right_count) = index;
-
-                        left_count += goes_left;
-                        right_count += 1 - goes_left;
-                    }
-                }
-                for i in mid..n {
-                    unsafe {
-                        let index = *indices.get_unchecked(i);
-                        let bin = ((*pb_ptr.add(index as usize) >> shift) & 0xFF) as u8;
-                        let goes_left = if bin == sentinel { missing } else { (bin <= t) as usize };
-
-                        *left_buffer.get_unchecked_mut(left_count) = index;
-                        *right_buffer.get_unchecked_mut(right_count) = index;
-
-                        left_count += goes_left;
-                        right_count += 1 - goes_left;
-                    }
+        let check_left = |row: u32| -> bool {
+            let bin = ((bins[row as usize] >> shift) & 0xFF) as u8;
+            if bin == sentinel { missing } else {
+                match &split.threshold {
+                    BinSplit::Numeric(t) => bin <= *t as u8,
+                    BinSplit::Categorical(cats) => cats[bin as usize],
                 }
             }
-            BinSplit::Categorical(cats) => {
-                for i in 0..mid {
-                    unsafe {
-                        let ahead_row = *indices.get_unchecked(i + PREFETCH_DIST) as usize;
-                        prefetch(pb_ptr.add(ahead_row));
+        };
 
-                        let row = *indices.get_unchecked(i);
-                        let bin = ((*pb_ptr.add(row as usize) >> shift) & 0xFF) as usize;
-                        
-                        let goes_left = if bin == sentinel as usize { missing } else { *cats.get_unchecked(bin) as usize };
+        // Algorithms differ between parallel and sequential execution. For parallel,
+        // 3 steps: (i) Evaluate check_left in parallel and store results in `flags`.
+        // Get `counts` containing the number of left rows per chunk. (ii) Prepare
+        // output slices for each chunk based on `counts`. (iii) Fill output buffers in
+        // parallel using `flags`
+        let total_left = if let Some(pool) = pool.filter(|_| n > 2048) {
+            let n_threads = pool.current_num_threads();
+            let chunk_size = (n / (n_threads * 32)).max(1024);
 
-                        *left_buffer.get_unchecked_mut(left_count) = row;
-                        *right_buffer.get_unchecked_mut(right_count) = row;
+            // (i) Write `check_left` into `flags` and get counts of left rows per chunk
+            let counts: Vec<usize> = pool.install(|| {
+                indices.par_chunks(chunk_size)
+                    .zip(flags[..n].par_chunks_mut(chunk_size))
+                    .map(|(chunk, chunk_flags)| {
+                        let mut count = 0;
+                        for (j, &row) in chunk.iter().enumerate() {
+                            let left = check_left(row);
+                            chunk_flags[j] = left;
+                            if left { count += 1; }
+                        }
+                        count
+                    }).collect()
+            });
 
-                        left_count += goes_left;
-                        right_count += 1 - goes_left;
-                    }
-                }
-                for i in mid..n {
-                    unsafe {
-                        let row = *indices.get_unchecked(i);
-                        let bin = ((*pb_ptr.add(row as usize) >> shift) & 0xFF) as usize;
-                        let goes_left = if bin == sentinel as usize { missing } else { *cats.get_unchecked(bin) as usize };
+            // (ii) Sequentially, prepare output slices based on `counts`. Use
+            // `split_at_mut` to write into (disjoint) slices of left/right slices
+            // without unsafe indexing.
+            let mut left_slices = Vec::new();
+            let mut right_slices = Vec::new();
+            let mut left_remaining = &mut *left_buffer;
+            let mut right_remaining = &mut *right_buffer;
+            for (i, &left_count) in counts.iter().enumerate() {
+                // this is chunk_size except for the last chunk, which may be smaller.
+                let chunk_length: usize = (i * chunk_size + chunk_size).min(n) - i * chunk_size;
+                let (left_current, left_tail) = left_remaining.split_at_mut(left_count);
+                let (right_current, right_tail) = right_remaining.split_at_mut(chunk_length - left_count);
+                left_slices.push(left_current);
+                right_slices.push(right_current);
+                left_remaining = left_tail;
+                right_remaining = right_tail;
+            }
 
-                        *left_buffer.get_unchecked_mut(left_count) = row;
-                        *right_buffer.get_unchecked_mut(right_count) = row;
-
-                        left_count += goes_left;
-                        right_count += 1 - goes_left;
-                    }
+            // (iii) In parallel, fill the output buffers based on `flags`. Each chunk
+            // writes to its output slice.
+            pool.install(|| {
+                indices.par_chunks(chunk_size)
+                    .zip(left_slices)
+                    .zip(right_slices)
+                    .zip(flags[..n].par_chunks(chunk_size))
+                    .for_each(|(((indices_chunk, left_out), right_out), flags_chunk)| {
+                        let (mut left_idx, mut right_idx) = (0, 0);
+                        for (j, &row) in indices_chunk.iter().enumerate() {
+                            if flags_chunk[j] {
+                                left_out[left_idx] = row;
+                                left_idx += 1;
+                            } else {
+                                right_out[right_idx] = row;
+                                right_idx += 1;
+                            }
+                        }
+                    });
+            });
+            counts.iter().sum()
+        } else {
+            // much simpler sequential partitioning.
+            let (mut l, mut r) = (0, 0);
+            for &row in indices.iter() {
+                if check_left(row) {
+                    left_buffer[l] = row;
+                    l += 1;
+                } else {
+                    right_buffer[r] = row;
+                    r += 1;
                 }
             }
-        }
+            l
+        };
 
-        indices[..left_count].copy_from_slice(&left_buffer[..left_count]);
-        indices[left_count..].copy_from_slice(&right_buffer[..right_count]);
-
-        left_count
+        indices[..total_left].copy_from_slice(&left_buffer[..total_left]);
+        indices[total_left..].copy_from_slice(&right_buffer[..n - total_left]);
+        total_left
     }
 }
 
