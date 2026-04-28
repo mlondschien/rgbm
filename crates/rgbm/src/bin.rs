@@ -14,8 +14,8 @@ const MAX_NUM_BINS: usize = 255;
 /// Bin mapping rules. Nulls, NaNs, and unknown categories map to bin index -1 = 255.
 #[derive(Clone)]
 pub enum FeatureBinner {
-    // values are upper bounds. For 3 bins (-inf, 0), [0, inf), and missings, upper
-    // bounds would be [0.0].
+    // values are upper bounds. For 3 bins (-inf, 0], (0, inf], and missings, upper
+    // bounds would be [0.0, inf].
     Numerical(Vec<f64>),
     // Map from category strings to bin indices. Missings are not category strings but
     // map to the sentinel bin index.
@@ -80,7 +80,7 @@ impl FeatureBinner {
                 let raw_values = values.values();
 
                 // unknown bins map past the last index. Equal to self::num_bins() - 1.
-                let sentinel = upper_bounds.len() as u8 + 1;
+                let sentinel = upper_bounds.len() as u8;
                 let mut binned_values = Vec::with_capacity(raw_values.len());
 
                 // Check for nulls outside the main loop to avoid branches. Nulls are
@@ -143,9 +143,9 @@ impl FeatureBinner {
     // Number of bins, including the sentinel bin.
     pub fn num_bins(&self) -> usize {
         match self {
-            // For bins (-inf, 0), [0, inf), and missings -> upper_bounds = [0.0],
+            // For bins (-inf, 0], (0, inf], and missings -> upper_bounds = [0.0, inf],
             // num_bins = 3.
-            FeatureBinner::Numerical(upper_bounds) => upper_bounds.len() + 2,
+            FeatureBinner::Numerical(upper_bounds) => upper_bounds.len() + 1,
             // +1 as missings and unknown categories are implicit.
             FeatureBinner::Categorical(cats) => cats.len() + 1,
         }
@@ -165,7 +165,7 @@ impl FeatureBinner {
 /// to lgbm's more complex "is_big" heuristic, but achieves the same goal in practice.
 fn greedy_find_bins(sorted_values: &[f64], max_bin: usize, min_data_in_bin: usize) -> Vec<f64> {
     if sorted_values.is_empty() {
-        return vec![];
+        return vec![f64::INFINITY];
     }
 
     // Compress sorted data into (value, count) pairs. Requires sorted input.
@@ -204,6 +204,7 @@ fn greedy_find_bins(sorted_values: &[f64], max_bin: usize, min_data_in_bin: usiz
         }
     }
 
+    bounds.push(f64::INFINITY);
     bounds
 }
 
@@ -223,6 +224,7 @@ mod tests {
         let arr = make_array(&[1.0, 2.0, 3.0, 1.0, 2.0]);
         let binner = FeatureBinner::new(&arr, 255, 1);
         assert_eq!(binner.apply(&arr), vec![0, 1, 2, 0, 1]);
+        assert_eq!(binner.num_bins(), 4);
     }
 
     #[test]
@@ -247,6 +249,13 @@ mod tests {
         assert!((bins[1] as usize) < binner.num_bins());
         // valid value maps to a different bin
         assert_ne!(bins[0], bins[1]);
+
+        // ensure we can get a threshold for all bins except sentinel
+        use crate::histogram::BinSplit;
+        use crate::tree::Threshold;
+        for t in 0..binner.num_bins() - 1 {
+            Threshold::from_bin_split(&BinSplit::Numeric(t as u32), &binner);
+        }
     }
 
     #[test]
