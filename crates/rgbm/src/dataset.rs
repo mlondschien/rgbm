@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Malte Londschien
+// SPDX-License-Identifier: BSD-3-Clause
+
 use arrow::array::{Float64Array, RecordBatch};
 use rayon::prelude::*;
 

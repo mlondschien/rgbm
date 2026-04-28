@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Malte Londschien
+// SPDX-License-Identifier: BSD-3-Clause
+
 #[derive(Clone, Debug)]
 pub struct BoosterParameters {
     pub num_iterations: usize,

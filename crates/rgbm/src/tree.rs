@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Malte Londschien
+// SPDX-License-Identifier: BSD-3-Clause
+
 use arrow::array::{Array, PrimitiveArray};
 use arrow::datatypes::Float64Type;
 use rayon::prelude::*;
@@ -376,7 +379,7 @@ impl Tree {
 /// Gather `grad_hess[indices[i]]` into `out[i]` for `i` in `indices`.
 #[inline(always)]
 fn gather_gradients(indices: &[u32], grad_hess: &[[f32; 2]], out: &mut [[f32; 2]]) {
-    const PREFETCH_DIST: usize = 16;
+    const PREFETCH_DIST: usize = 64;
     let n = indices.len();
     let mid = n.saturating_sub(PREFETCH_DIST);
     let gh_ptr = grad_hess.as_ptr();

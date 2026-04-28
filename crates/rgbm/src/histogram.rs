@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Malte Londschien
+// SPDX-License-Identifier: BSD-3-Clause
+
 //! Histogram-based gradient and hessian accumulation, and best-split finding.
 
 use rayon::prelude::*;
@@ -72,7 +75,7 @@ impl Histograms {
     pub fn build_into(bundle: &FeatureBundle, packed_gh: &[[f32; 2]], row_indices: &[u32], bins: &mut [HistogramBin]) {
         let p0 = bins.as_mut_ptr();
 
-        const PREFETCH_DIST: usize = 16;
+        const PREFETCH_DIST: usize = 32;
         // mid is even so the 2-way unrolled main loop has no remainder.
         let mid = (row_indices.len().saturating_sub(PREFETCH_DIST) / 2) * 2;
 

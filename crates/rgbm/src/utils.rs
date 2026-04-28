@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Malte Londschien
+// SPDX-License-Identifier: BSD-3-Clause
+
 pub fn build_thread_pool(n_jobs: isize) -> Option<rayon::ThreadPool> {
     let n_threads = match n_jobs {
         n if n <= 0 => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),

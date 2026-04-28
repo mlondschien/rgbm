@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Malte Londschien
+// SPDX-License-Identifier: BSD-3-Clause
+
 //! Feature binning: converts continuous f64 values and categorical strings to bin indices.
 
 use ahash::AHashMap;

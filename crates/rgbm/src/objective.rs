@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Malte Londschien
+// SPDX-License-Identifier: BSD-3-Clause
+
 use rayon::prelude::*;
 
 /// Objective function for gradient boosting — computes per-row gradients and hessians.

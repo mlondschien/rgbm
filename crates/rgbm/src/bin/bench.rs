@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Malte Londschien
+// SPDX-License-Identifier: BSD-3-Clause
+
 use std::sync::Arc;
 use arrow::array::{DictionaryArray, Float64Array, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema, UInt32Type};
