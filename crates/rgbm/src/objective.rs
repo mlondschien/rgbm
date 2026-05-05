@@ -10,9 +10,9 @@ pub trait Objective: Send + Sync {
     fn prediction(&self, score: f64) -> f64;
 }
 
-pub struct SquaredLoss;
+pub struct Gaussian;
 
-impl Objective for SquaredLoss {
+impl Objective for Gaussian {
     fn gradient_hessian(&self, labels: &[f64], scores: &[f64], out: &mut [[f32; 2]], pool: Option<&rayon::ThreadPool>) {
         match pool {
             Some(pool) => pool.install(|| {
@@ -41,9 +41,9 @@ impl Objective for SquaredLoss {
 }
 
 /// Binary cross-entropy. Scores are log-odds; labels are in {0, 1}.
-pub struct BinaryLogloss;
+pub struct Logistic;
 
-impl Objective for BinaryLogloss {
+impl Objective for Logistic {
     fn gradient_hessian(&self, labels: &[f64], scores: &[f64], out: &mut [[f32; 2]], pool: Option<&rayon::ThreadPool>) {
         match pool {
             Some(pool) => pool.install(|| {

@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 
 use ::rgbm::booster::Booster;
 use ::rgbm::dataset::Dataset;
-use ::rgbm::objective::{BinaryLogloss, Objective, Probit, SquaredLoss};
+use ::rgbm::objective::{Gaussian, Logistic, Objective, Probit};
 use ::rgbm::parameters::{BoosterParameters, DatasetParameters};
 
 #[pyclass(name = "Dataset")]
@@ -45,7 +45,7 @@ struct PyBooster {
 impl PyBooster {
     #[new]
     #[pyo3(signature = (
-        objective = "squared_loss",
+        objective = "gaussian",
         num_iterations = 100,
         learning_rate = 0.1,
         max_depth = 6,
@@ -69,11 +69,11 @@ impl PyBooster {
         n_jobs: isize,
     ) -> PyResult<Self> {
         let obj: Box<dyn Objective> = match objective {
-            "squared_loss"   => Box::new(SquaredLoss),
-            "binary_logloss" => Box::new(BinaryLogloss),
-            "probit"         => Box::new(Probit),
+            "gaussian" => Box::new(Gaussian),
+            "logistic" => Box::new(Logistic),
+            "probit"   => Box::new(Probit),
             _ => return Err(PyValueError::new_err(format!(
-                "unknown objective '{objective}'; expected one of: squared_loss, binary_logloss, probit"
+                "unknown objective '{objective}'; expected one of: gaussian, logistic, probit"
             ))),
         };
 

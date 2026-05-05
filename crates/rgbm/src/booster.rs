@@ -115,7 +115,7 @@ mod tests {
     use arrow::array::Float64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use crate::dataset::Dataset;
-    use crate::objective::{BinaryLogloss, Probit, SquaredLoss};
+    use crate::objective::{Gaussian, Logistic, Probit};
     use crate::parameters::{BoosterParameters, DatasetParameters};
 
     fn make_dataset(x: Vec<f64>, y: Vec<f64>) -> (Dataset, RecordBatch) {
@@ -138,7 +138,7 @@ mod tests {
     fn test_base_score_is_mean() {
         let y = vec![0.0, 1.0, 2.0, 3.0];
         let (dataset, _) = make_dataset(vec![0.0, 1.0, 2.0, 3.0], y.clone());
-        let mut booster = Booster::new(BoosterParameters { num_iterations: 0, ..test_params() }, Box::new(SquaredLoss));
+        let mut booster = Booster::new(BoosterParameters { num_iterations: 0, ..test_params() }, Box::new(Gaussian));
         booster.fit(&dataset);
         assert!((booster.base_score - 1.5).abs() < 1e-10);
     }
@@ -152,7 +152,7 @@ mod tests {
 
         let variance = y.iter().map(|&yi| (yi - 1.5f64).powi(2)).sum::<f64>() / n as f64;
 
-        let mut booster = Booster::new(test_params(), Box::new(SquaredLoss));
+        let mut booster = Booster::new(test_params(), Box::new(Gaussian));
         booster.fit(&dataset);
         let preds = booster.predict(&batch);
         assert!(mse(&preds, &y) < variance * 0.01);
@@ -182,7 +182,7 @@ mod tests {
         let y: Vec<f64> = x.iter().map(|&xi| if xi > 0.5 { 1.0 } else { 0.0 }).collect();
         let (dataset, batch) = make_dataset(x, y.clone());
 
-        let mut booster = Booster::new(test_params(), Box::new(BinaryLogloss));
+        let mut booster = Booster::new(test_params(), Box::new(Logistic));
         booster.fit(&dataset);
         let preds = booster.predict(&batch);
 

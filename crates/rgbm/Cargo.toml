@@ -2,6 +2,11 @@
 name = "rgbm"
 version = "0.1.0"
 edition = "2024"
+description = "A fast and lean Gradient Boosting Machine implementation in Rust."
+license = "BSD-3-Clause"
+repository = "https://github.com/mlondschien/rgbm"
+readme = "README.md"
+keywords = ["gbm", "gbdt", "gradient-boosting"]
 
 [dependencies]
 arrow = { workspace = true }

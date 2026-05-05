@@ -2,6 +2,10 @@
 name = "rgbm-python"
 version = "0.1.0"
 edition = "2024"
+description = "Python bindings for rgbm, a fast Gradient Boosting Machine."
+license = "BSD-3-Clause"
+repository = "https://github.com/mlondschien/rgbm"
+readme = "README.md"
 
 [lib]
 name = "rgbm"
