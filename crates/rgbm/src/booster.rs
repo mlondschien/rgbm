@@ -192,4 +192,26 @@ mod tests {
             .count();
         assert!(correct as f64 / n as f64 > 0.95);
     }
+
+    #[test]
+    fn test_min_gain_to_split_blocks_splits() {
+        // With min_gain_to_split set astronomically high, no split ever clears the bar,
+        // so every tree is a single leaf. After iteration 1 the total gradient is 0
+        // (base_score == label mean for Gaussian), so every leaf value is 0 and
+        // predictions remain at base_score.
+        let n = 200;
+        let x: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
+        let y: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 1.0).collect();
+        let (dataset, batch) = make_dataset(x, y.clone());
+
+        let params = BoosterParameters { min_gain_to_split: 1e18, ..test_params() };
+        let mut booster = Booster::new(params, Box::new(Gaussian));
+        booster.fit(&dataset);
+        let preds = booster.predict(&batch);
+
+        let mean_y: f64 = y.iter().sum::<f64>() / n as f64;
+        for &p in preds.values() {
+            assert!((p - mean_y).abs() < 1e-9, "expected {mean_y}, got {p}");
+        }
+    }
 }

@@ -350,11 +350,11 @@ impl Histograms {
             }
         }
 
-        // Only ever split with positive gain.
-        if best_score <= parent_score { return None; }
+        let gain = best_score - parent_score;
+        if gain <= parameters.min_gain_to_split { return None; }
 
         Some(SplitInfo {
-            gain: best_score - parent_score,
+            gain,
             missing_goes_left: best_missing_goes_left,
             threshold: BinSplit::Numeric(best_threshold as u32),
             feature_index: 0, // to be filled in by caller
@@ -413,7 +413,8 @@ impl Histograms {
             );
         }
 
-        if best_score <= parent_score { return None; }
+        let gain = best_score - parent_score;
+        if gain <= parameters.min_gain_to_split { return None; }
 
         let mut best_missing_goes_left = best_majority_goes_left;
         let mut goes_left = vec![best_majority_goes_left; num_bins - 1];
@@ -429,7 +430,7 @@ impl Histograms {
         }
 
         Some(SplitInfo {
-            gain: best_score - parent_score,
+            gain,
             missing_goes_left: best_missing_goes_left,
             threshold: BinSplit::Categorical(goes_left),
             feature_index: 0, // to be filled in by caller

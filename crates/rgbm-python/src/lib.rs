@@ -50,6 +50,7 @@ impl PyBooster {
         learning_rate = 0.1,
         max_depth = 6,
         min_sum_hessian_in_leaf = 1e-3,
+        min_gain_to_split = 0.0,
         lambda_l1 = 0.0,
         lambda_l2 = 0.0,
         max_leaves = 31,
@@ -62,6 +63,7 @@ impl PyBooster {
         learning_rate: f64,
         max_depth: usize,
         min_sum_hessian_in_leaf: f64,
+        min_gain_to_split: f64,
         lambda_l1: f64,
         lambda_l2: f64,
         max_leaves: usize,
@@ -80,7 +82,7 @@ impl PyBooster {
         Ok(Self {
             booster: Booster::new(BoosterParameters {
                 num_iterations, learning_rate, max_depth,
-                min_sum_hessian_in_leaf,
+                min_sum_hessian_in_leaf, min_gain_to_split,
                 lambda_l1, lambda_l2, max_leaves, leaf_wise, n_jobs,
             }, obj),
         })
