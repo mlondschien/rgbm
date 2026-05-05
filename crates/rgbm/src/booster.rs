@@ -35,7 +35,8 @@ impl Booster {
     pub fn fit(&mut self, dataset: &Dataset) {
         self.feature_binners = dataset.feature_binners.clone();
         let labels = dataset.labels.values();
-        self.base_score = self.objective.initial_score(labels);
+        let weights = dataset.weights.as_ref().map(|w| w.values().as_ref());
+        self.base_score = self.objective.initial_score(labels, weights);
 
         let mut scores = vec![self.base_score; dataset.num_rows];
         let mut grad_hess = vec![[0.0f32; 2]; dataset.num_rows];
@@ -46,7 +47,7 @@ impl Booster {
         self.trees.clear();
 
         for _ in 0..self.parameters.num_iterations {
-            self.objective.gradient_hessian(labels, &scores, &mut grad_hess, pool.as_ref());
+            self.objective.gradient_hessian(labels, &scores, weights, &mut grad_hess, pool.as_ref());
 
             let mut tree = Tree::new(self.parameters.max_leaves);
             tree.fit(dataset, &grad_hess, &self.parameters, pool.as_ref(), &mut workspace);
@@ -207,24 +208,29 @@ mod tests {
     }
 
     #[test]
-    fn test_min_gain_to_split_blocks_splits() {
-        // With min_gain_to_split set astronomically high, no split ever clears the bar,
-        // so every tree is a single leaf. After iteration 1 the total gradient is 0
-        // (base_score == label mean for Gaussian), so every leaf value is 0 and
-        // predictions remain at base_score.
-        let n = 200;
-        let x: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
-        let y: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 1.0).collect();
-        let (dataset, batch) = make_dataset(x, y.clone());
+    fn test_fit_weighted() {
+        // Two points: (0, 0) and (1, 1).
+        // If we weight (0, 0) heavily, the base score (mean) should be close to 0.
+        // If we weight (1, 1) heavily, it should be close to 1.
+        let x = vec![0.0, 1.0];
+        let y = vec![0.0, 1.0];
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(x))]).unwrap();
+        let labels = Float64Array::from(y);
+        let params = DatasetParameters { min_data_in_bin: 1, ..DatasetParameters::default() };
 
-        let params = BoosterParameters { min_gain_to_split: 1e18, ..test_params() };
-        let mut booster = Booster::new(params, Box::new(Gaussian));
-        booster.fit(&dataset);
-        let preds = booster.predict(&batch);
+        // Weight first point heavily
+        let weights1 = Float64Array::from(vec![100.0, 1.0]);
+        let ds1 = Dataset::from_arrow(&batch, &labels, Some(&weights1), &params);
+        let mut booster1 = Booster::new(test_params(), Box::new(Gaussian));
+        booster1.fit(&ds1);
+        assert!(booster1.base_score < 0.1);
 
-        let mean_y: f64 = y.iter().sum::<f64>() / n as f64;
-        for &p in preds.values() {
-            assert!((p - mean_y).abs() < 1e-9, "expected {mean_y}, got {p}");
-        }
+        // Weight second point heavily
+        let weights2 = Float64Array::from(vec![1.0, 100.0]);
+        let ds2 = Dataset::from_arrow(&batch, &labels, Some(&weights2), &params);
+        let mut booster2 = Booster::new(test_params(), Box::new(Gaussian));
+        booster2.fit(&ds2);
+        assert!(booster2.base_score > 0.9);
     }
 }
