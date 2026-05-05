@@ -121,7 +121,7 @@ impl FeatureBinner {
                     })
                     .collect();
 
-                let keys = dict.normalized_keys(); 
+                let keys = dict.normalized_keys();
                 let mut binned_values = Vec::with_capacity(dict.len());
                 
                 // Same as for numericals: Check for nulls outside the main loop.
@@ -138,7 +138,7 @@ impl FeatureBinner {
                         binned_values.push(key_to_bin[key as usize]);
                     }
                 }
-            binned_values
+                binned_values
             }
         }
     }

@@ -270,8 +270,8 @@ impl Histograms {
         debug_assert_eq!(self.bins.len(), other.bins.len());
 
         for (s, o) in self.bins.iter_mut().zip(other.bins.iter()) {
-            s.sum_gradients = s.sum_gradients - o.sum_gradients;
-            s.sum_hessians = s.sum_hessians - o.sum_hessians;
+            s.sum_gradients -= o.sum_gradients;
+            s.sum_hessians -= o.sum_hessians;
         }
     }
 

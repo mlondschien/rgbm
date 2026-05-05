@@ -175,6 +175,13 @@ mod tests {
         assert!(correct as f64 / n as f64 > 0.95);
     }
 
+    fn logloss(preds: &Float64Array, labels: &[f64]) -> f64 {
+        preds.values().iter().zip(labels).map(|(&p, &y)| {
+            let p = p.clamp(1e-15, 1.0 - 1e-15);
+            - (y * p.ln() + (1.0 - y) * (1.0 - p).ln())
+        }).sum::<f64>() / labels.len() as f64
+    }
+
     #[test]
     fn test_fit_classification_reduces_logloss() {
         let n = 200;
@@ -182,11 +189,17 @@ mod tests {
         let y: Vec<f64> = x.iter().map(|&xi| if xi > 0.5 { 1.0 } else { 0.0 }).collect();
         let (dataset, batch) = make_dataset(x, y.clone());
 
+        let initial_p = y.iter().sum::<f64>() / n as f64;
+        let initial_logloss = logloss(&Float64Array::from(vec![initial_p; n]), &y);
+
         let mut booster = Booster::new(test_params(), Box::new(Logistic));
         booster.fit(&dataset);
         let preds = booster.predict(&batch);
 
-        // predictions should be on the correct side of 0.5
+        let final_logloss = logloss(&preds, &y);
+        assert!(final_logloss < initial_logloss * 0.1);
+
+        // also check accuracy as a sanity check
         let correct = preds.values().iter().zip(&y)
             .filter(|&(&p, &yi)| (p > 0.5) == (yi > 0.5))
             .count();
