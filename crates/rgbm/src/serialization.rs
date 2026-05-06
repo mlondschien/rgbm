@@ -37,7 +37,7 @@ shrinkage=1
 
         for (i, tree) in self.trees.iter().enumerate() {
             let mut t = format!("Tree={}\n", i + 1);
-            tree.write_to_string(&mut t);
+            tree.write_to_string(&mut t, &self.feature_binners);
             t.push_str("\n\n");
             tree_texts.push(t);
         }
@@ -90,7 +90,7 @@ pandas_categorical:null
 }
 
 impl Tree {
-    pub(crate) fn write_to_string(&self, s: &mut String) {
+    pub(crate) fn write_to_string(&self, s: &mut String, binners: &[FeatureBinner]) {
         // LightGBM's child indexing: i for internal node i, -(j+1) for leaf j.
         let mut node_idx = vec![0i32; self.nodes.len()];
         let mut leaf_values = Vec::new();
@@ -124,7 +124,15 @@ impl Tree {
                 Threshold::Categorical(bitset) => {
                     d |= 1;
                     threshold.push((cat_boundaries.len() - 1) as f64);
-                    for &word in bitset {
+                    // The bitset's sentinel bit encodes missing routing; lgbm conveys
+                    // that via decision_type / missing_type instead, so mask it out.
+                    let sentinel_bin = match &binners[*sf as usize] {
+                        FeatureBinner::Categorical(map) => map.len(),
+                        FeatureBinner::Numerical(_) => unreachable!(),
+                    };
+                    let mut bs = *bitset;
+                    bs[sentinel_bin / 64] &= !(1u64 << (sentinel_bin % 64));
+                    for &word in &bs {
                         cat_thresholds.push(word as u32);
                         cat_thresholds.push((word >> 32) as u32);
                     }

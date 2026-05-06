@@ -416,18 +416,13 @@ impl Histograms {
         let gain = best_score - parent_score;
         if gain <= parameters.min_gain_to_split { return None; }
 
-        let mut best_missing_goes_left = best_majority_goes_left;
-        let mut goes_left = vec![best_majority_goes_left; num_bins - 1];
-    
+        let mut goes_left = vec![best_majority_goes_left; num_bins];
         for (i, &(_, k)) in categorical_order.iter().enumerate() {
-            let is_left = i <= best_threshold;
-            
-            if k == num_bins - 1 {
-                best_missing_goes_left = is_left;
-            } else {
-                goes_left[k] = is_left;
-            }
+            goes_left[k] = i <= best_threshold;
         }
+        // The sentinel/missing bin sits at num_bins - 1; mirror its bitset routing into
+        // missing_goes_left so serialization can emit it as the lgbm decision_type bit.
+        let best_missing_goes_left = goes_left[num_bins - 1];
 
         Some(SplitInfo {
             gain,
