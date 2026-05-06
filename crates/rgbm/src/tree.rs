@@ -10,7 +10,6 @@ use crate::dataset::Dataset;
 use crate::histogram::{BinSplit, Histograms, SplitInfo};
 use crate::parameters::BoosterParameters;
 use crate::histogram::calculate_score;
-use crate::utils::prefetch;
 
 /// Reusable scratch buffers for tree fitting, owned by the Booster and passed in each
 /// iteration to avoid repeated allocation of O(num_rows) memory.
@@ -141,14 +140,18 @@ impl Tree {
             if left_len < right_len {
                 let left_indices = &workspace.all_indices[left_start..left_start + left_len];
                 let ordered_grad_hess = &mut workspace.ordered_gh[..left_len];
-                gather_gradients(left_indices, grad_hess, ordered_grad_hess);
+                for (out, &row) in ordered_grad_hess.iter_mut().zip(left_indices) {
+                    *out = grad_hess[row as usize];
+                }
                 left_histograms = Histograms::build(&dataset.feature_bundles, ordered_grad_hess, left_indices, pool);
                 right_histograms = leaf.histograms;
                 right_histograms.subtract(&left_histograms);
             } else {
                 let right_indices = &workspace.all_indices[right_start..right_start + right_len];
                 let ordered_grad_hess = &mut workspace.ordered_gh[..right_len];
-                gather_gradients(right_indices, grad_hess, ordered_grad_hess);
+                for (out, &row) in ordered_grad_hess.iter_mut().zip(right_indices) {
+                    *out = grad_hess[row as usize];
+                }
                 right_histograms = Histograms::build(&dataset.feature_bundles, ordered_grad_hess, right_indices, pool);
                 left_histograms = leaf.histograms;
                 left_histograms.subtract(&right_histograms);
@@ -373,30 +376,6 @@ impl Tree {
         indices[..total_left].copy_from_slice(&left_buffer[..total_left]);
         indices[total_left..].copy_from_slice(&right_buffer[..n - total_left]);
         total_left
-    }
-}
-
-/// Gather `grad_hess[indices[i]]` into `out[i]` for `i` in `indices`.
-#[inline(always)]
-fn gather_gradients(indices: &[u32], grad_hess: &[[f32; 2]], out: &mut [[f32; 2]]) {
-    const PREFETCH_DIST: usize = 64;
-    let n = indices.len();
-    let mid = n.saturating_sub(PREFETCH_DIST);
-    let gh_ptr = grad_hess.as_ptr();
-
-    for i in 0..mid {
-        unsafe {
-            let prefetch_index = *indices.get_unchecked(i + PREFETCH_DIST) as usize;
-            prefetch(gh_ptr.add(prefetch_index));
-            let index = *indices.get_unchecked(i) as usize;
-            *out.get_unchecked_mut(i) = *gh_ptr.add(index);
-        }
-    }
-    for i in mid..n {
-        unsafe {
-            let index = *indices.get_unchecked(i) as usize;
-            *out.get_unchecked_mut(i) = *gh_ptr.add(index);
-        }
     }
 }
 
