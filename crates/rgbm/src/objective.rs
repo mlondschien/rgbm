@@ -5,7 +5,7 @@ use rayon::prelude::*;
 
 /// Objective function for gradient boosting — computes per-row gradients and hessians.
 pub trait Objective: Send + Sync {
-    fn name(&self) -> &str;
+    fn lgbm_name(&self) -> &str;
     fn gradient_hessian(&self, labels: &[f64], scores: &[f64], weights: Option<&[f64]>, out: &mut [[f32; 2]], pool: Option<&rayon::ThreadPool>);
     fn initial_score(&self, labels: &[f64], weights: Option<&[f64]>) -> f64;
     fn prediction(&self, score: f64) -> f64;
@@ -14,7 +14,7 @@ pub trait Objective: Send + Sync {
 pub struct Gaussian;
 
 impl Objective for Gaussian {
-    fn name(&self) -> &str { "regression" }
+    fn lgbm_name(&self) -> &str { "regression" }
     fn gradient_hessian(&self, labels: &[f64], scores: &[f64], weights: Option<&[f64]>, out: &mut [[f32; 2]], pool: Option<&rayon::ThreadPool>) {
         match (pool, weights) {
             (Some(pool), Some(weights)) => pool.install(|| {
@@ -67,7 +67,7 @@ impl Objective for Gaussian {
 pub struct Logistic;
 
 impl Objective for Logistic {
-    fn name(&self) -> &str { "binary" }
+    fn lgbm_name(&self) -> &str { "binary" }
 
     fn gradient_hessian(&self, labels: &[f64], scores: &[f64], weights: Option<&[f64]>, out: &mut [[f32; 2]], pool: Option<&rayon::ThreadPool>) {
         match (pool, weights) {
@@ -138,7 +138,7 @@ impl Probit {
 }
 
 impl Objective for Probit {
-    fn name(&self) -> &str { "probit" }
+    fn lgbm_name(&self) -> &str { "binary" }
 
     fn gradient_hessian(&self, labels: &[f64], scores: &[f64], weights: Option<&[f64]>, out: &mut [[f32; 2]], pool: Option<&rayon::ThreadPool>) {
         match (pool, weights) {
