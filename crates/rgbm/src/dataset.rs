@@ -66,13 +66,13 @@ impl Dataset {
         let (feature_binners, all_bins): (Vec<_>, Vec<_>) = match &pool {
             Some(pool) => pool.install(|| {
                 features.columns().par_iter().map(|array| {
-                    let binner = FeatureBinner::new(array.as_ref(), params.max_bin, params.min_data_in_bin);
+                    let binner = FeatureBinner::new(array.as_ref(), params.max_bin, params.min_data_in_bin, params.seed);
                     let bins = binner.apply(array.as_ref());
                     (binner, bins)
                 }).unzip()
             }),
             None => features.columns().iter().map(|array| {
-                let binner = FeatureBinner::new(array.as_ref(), params.max_bin, params.min_data_in_bin);
+                let binner = FeatureBinner::new(array.as_ref(), params.max_bin, params.min_data_in_bin, params.seed);
                 let bins = binner.apply(array.as_ref());
                 (binner, bins)
             }).unzip(),

@@ -39,6 +39,7 @@ pub struct DatasetParameters {
     pub max_bin: usize,
     pub min_data_in_bin: usize,
     pub n_jobs: isize,
+    pub seed: u64,
 }
 
 impl Default for DatasetParameters {
@@ -47,6 +48,7 @@ impl Default for DatasetParameters {
             max_bin: 255,
             min_data_in_bin: 3,
             n_jobs: -1,
+            seed: 0,
         }
     }
 }

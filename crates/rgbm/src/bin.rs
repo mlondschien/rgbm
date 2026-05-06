@@ -26,17 +26,16 @@ pub enum FeatureBinner {
 }
 
 impl FeatureBinner {
-    pub fn new(array: &dyn Array, max_bin: usize, min_data_in_bin: usize) -> Self {
+    pub fn new(array: &dyn Array, max_bin: usize, min_data_in_bin: usize, seed: u64) -> Self {
         assert!(max_bin <= MAX_NUM_BINS, "max_bin {max_bin} exceeds maximum of {MAX_NUM_BINS}");
         match array.data_type() {
             DataType::Float64 => {
                 let values = array.as_primitive::<Float64Type>();
 
-                // todo: use booster's seed once we have it
                 // For very large datasets, use a subsample of the dataset to determine
                 // bin boundaries.
                 const MAX_SAMPLE: usize = 200_000;  // same as LGBM
-                let mut rng = StdRng::seed_from_u64(0);
+                let mut rng = StdRng::seed_from_u64(seed);
                 let mut valid = values.iter().flatten().filter(|x| !x.is_nan())
                     .choose_multiple(&mut rng, MAX_SAMPLE);
                 valid.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
@@ -225,7 +224,7 @@ mod tests {
     fn test_few_distinct_values() {
         // input [1.0, 2.0, 3.0, 1.0, 2.0] → bins [0, 1, 2, 0, 1], sentinel at 3
         let arr = make_array(&[1.0, 2.0, 3.0, 1.0, 2.0]);
-        let binner = FeatureBinner::new(&arr, 255, 1);
+        let binner = FeatureBinner::new(&arr, 255, 1, 0);
         assert_eq!(binner.apply(&arr), vec![0, 1, 2, 0, 1]);
         assert_eq!(binner.num_bins(), 4);
     }
@@ -234,7 +233,7 @@ mod tests {
     fn test_monotone_bin_assignment() {
         let values: Vec<f64> = (0..1000).map(|i| i as f64 * 0.1).collect();
         let arr = make_array(&values);
-        let binner = FeatureBinner::new(&arr, 255, 1);
+        let binner = FeatureBinner::new(&arr, 255, 1, 0);
         let bins = binner.apply(&arr);
         for w in bins.windows(2) {
             assert!(w[0] <= w[1], "bins not monotone: {} > {}", w[0], w[1]);
@@ -244,7 +243,7 @@ mod tests {
     #[test]
     fn test_null_nan_sentinel() {
         let arr = Float64Array::from(vec![Some(1.0), None, Some(f64::NAN)]);
-        let binner = FeatureBinner::new(&arr, 255, 1);
+        let binner = FeatureBinner::new(&arr, 255, 1, 0);
         let bins = binner.apply(&arr);
         // null and NaN map to the same sentinel bin
         assert_eq!(bins[1], bins[2]);
@@ -265,8 +264,8 @@ mod tests {
     fn test_min_data_in_bin_reduces_bin_count() {
         let values: Vec<f64> = (0..100).map(|i| i as f64).collect();
         let arr = make_array(&values);
-        let strict = FeatureBinner::new(&arr, 255, 10);
-        let loose = FeatureBinner::new(&arr, 255, 1);
+        let strict = FeatureBinner::new(&arr, 255, 10, 0);
+        let loose = FeatureBinner::new(&arr, 255, 1, 0);
         assert!(strict.num_bins() <= loose.num_bins());
     }
 }

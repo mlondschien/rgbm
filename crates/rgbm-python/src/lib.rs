@@ -20,7 +20,7 @@ struct PyDataset {
 #[pymethods]
 impl PyDataset {
     #[new]
-    #[pyo3(signature = (x, y, weights=None, max_bin=255, min_data_in_bin=3, n_jobs=-1))]
+    #[pyo3(signature = (x, y, weights=None, max_bin=255, min_data_in_bin=3, n_jobs=-1, seed=0))]
     fn new(
         x: &Bound<'_, PyAny>,
         y: &Bound<'_, PyAny>,
@@ -28,6 +28,7 @@ impl PyDataset {
         max_bin: usize,
         min_data_in_bin: usize,
         n_jobs: isize,
+        seed: u64,
     ) -> PyResult<Self> {
         let batch = RecordBatch::from_pyarrow_bound(x)?;
         let labels = Float64Array::from(ArrayData::from_pyarrow_bound(y)?);
@@ -36,7 +37,7 @@ impl PyDataset {
         } else {
             None
         };
-        let params = DatasetParameters { max_bin, min_data_in_bin, n_jobs };
+        let params = DatasetParameters { max_bin, min_data_in_bin, n_jobs, seed };
         let inner = Dataset::from_arrow(&batch, &labels, weights.as_ref(), &params);
         Ok(Self { inner })
     }
