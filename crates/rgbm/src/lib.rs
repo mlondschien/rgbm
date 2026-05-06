@@ -7,5 +7,6 @@ pub mod dataset;
 pub mod histogram;
 pub mod objective;
 pub mod parameters;
+pub mod serialization;
 pub mod tree;
 pub mod utils;

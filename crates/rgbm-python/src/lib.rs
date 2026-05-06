@@ -99,6 +99,10 @@ impl PyBooster {
         Ok(())
     }
 
+    fn model_to_string(&self) -> String {
+        self.booster.model_to_string()
+    }
+
     fn predict(&self, py: Python<'_>, x: &Bound<'_, PyAny>) -> PyResult<Py<PyArray1<f64>>> {
         let batch = RecordBatch::from_pyarrow_bound(x)?;
         let result = py.allow_threads(|| self.booster.predict(&batch));

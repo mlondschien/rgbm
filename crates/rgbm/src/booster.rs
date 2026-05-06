@@ -19,6 +19,7 @@ pub struct Booster {
     pub trees: Vec<Tree>,
     pub base_score: f64,
     pub feature_binners: Vec<FeatureBinner>,
+    pub feature_names: Vec<String>,
 }
 
 impl Booster {
@@ -29,11 +30,13 @@ impl Booster {
             trees: Vec::new(),
             base_score: 0.0,
             feature_binners: Vec::new(),
+            feature_names: Vec::new(),
         }
     }
 
     pub fn fit(&mut self, dataset: &Dataset) {
         self.feature_binners = dataset.feature_binners.clone();
+        self.feature_names = dataset.feature_names.clone();
         let labels = dataset.labels.values();
         let weights = dataset.weights.as_ref().map(|w| w.values().as_ref());
         self.base_score = self.objective.initial_score(labels, weights);
