@@ -6,7 +6,8 @@
 use std::fmt::Write;
 use crate::bin::FeatureBinner;
 use crate::booster::Booster;
-use crate::tree::{Node, Threshold, Tree};
+use crate::histogram::Threshold;
+use crate::tree::{Node, Tree};
 
 impl Booster {
     pub fn model_to_string(&self) -> String {
@@ -114,34 +115,38 @@ impl Tree {
         let mut cat_boundaries: Vec<usize> = vec![0];
 
         for node in &self.nodes {
-            let Node::Internal { left_child: lc, right_child: rc, split_feature: sf, missing_goes_left, threshold: t } = node else { continue };
+            let Node::Internal { left_child: lc, right_child: rc, split_feature: sf, threshold: t } = node else { continue };
             split_feature.push(*sf);
+            left_child.push(node_idx[*lc as usize]);
+            right_child.push(node_idx[*rc as usize]);
+
             // bit 0: categorical, bit 1: default_left, bits 2-3: missing_type (NaN=2)
             let mut d = 8u8;
-            if *missing_goes_left { d |= 2; }
             match t {
-                Threshold::Numeric(v) => threshold.push(*v),
-                Threshold::Categorical(bitset) => {
+                Threshold::Numeric { bin, missing_goes_left } => {
+                    if *missing_goes_left { d |= 2; }
+                    let FeatureBinner::Numerical(upper_bounds) = &binners[*sf as usize] else { unreachable!() };
+                    threshold.push(upper_bounds[*bin as usize]);
+                }
+                Threshold::Categorical(cats) => {
                     d |= 1;
+                    // cats[sentinel_bin] encodes missing routing; lgbm conveys that via
+                    // the decision_type bit, so we skip that slot when packing.
+                    let sentinel_bin = cats.len() - 1;
+                    if cats[sentinel_bin] { d |= 2; }
                     threshold.push((cat_boundaries.len() - 1) as f64);
-                    // The bitset's sentinel bit encodes missing routing; lgbm conveys
-                    // that via decision_type / missing_type instead, so mask it out.
-                    let sentinel_bin = match &binners[*sf as usize] {
-                        FeatureBinner::Categorical(map) => map.len(),
-                        FeatureBinner::Numerical(_) => unreachable!(),
-                    };
-                    let mut bs = *bitset;
-                    bs[sentinel_bin / 64] &= !(1u64 << (sentinel_bin % 64));
-                    for &word in &bs {
-                        cat_thresholds.push(word as u32);
-                        cat_thresholds.push((word >> 32) as u32);
+                    // Pack directly into the lgbm cat_threshold format (8 u32 words = 256 bits).
+                    let start = cat_thresholds.len();
+                    cat_thresholds.resize(start + 8, 0);
+                    for (i, &left) in cats.iter().enumerate() {
+                        if left && i != sentinel_bin {
+                            cat_thresholds[start + i / 32] |= 1u32 << (i % 32);
+                        }
                     }
                     cat_boundaries.push(cat_thresholds.len());
                 }
             }
             decision_type.push(d);
-            left_child.push(node_idx[*lc as usize]);
-            right_child.push(node_idx[*rc as usize]);
         }
 
         fn join<T: std::fmt::Display>(v: &[T]) -> String {

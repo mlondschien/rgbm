@@ -1,8 +1,7 @@
 // Copyright (c) 2026 Malte Londschien
 // SPDX-License-Identifier: BSD-3-Clause
 
-use arrow::array::{Float64Array, PrimitiveArray};
-use arrow::datatypes::Float64Type;
+use arrow::array::Float64Array;
 use arrow::record_batch::RecordBatch;
 use rayon::prelude::*;
 
@@ -76,16 +75,13 @@ impl Booster {
     }
 
     pub fn predict(&self, batch: &RecordBatch) -> Float64Array {
-        let num_cols = batch.num_columns();
-        let mut numeric_columns: Vec<Option<&PrimitiveArray<Float64Type>>> = vec![None; num_cols];
-        let mut categorical_columns: Vec<Option<Vec<u8>>> = vec![None; num_cols];
-        for (i, col) in batch.columns().iter().enumerate() {
-            if let Some(arr) = col.as_any().downcast_ref::<PrimitiveArray<Float64Type>>() {
-                numeric_columns[i] = Some(arr);
-            } else if matches!(col.data_type(), arrow::datatypes::DataType::Dictionary(_, _)) {
-                categorical_columns[i] = Some(self.feature_binners[i].apply(col.as_ref()));
-            }
-        }
+        // Bin every column up-front. FeatureBinner::apply handles Float32 and the
+        // various dictionary value types via internal casts.
+        let columns: Vec<Vec<u8>> = self.feature_binners.iter().zip(batch.columns())
+            .map(|(b, col)| b.apply(col.as_ref()))
+            .collect();
+        let column_refs: Vec<&[u8]> = columns.iter().map(|c| c.as_slice()).collect();
+        let sentinels: Vec<u8> = self.feature_binners.iter().map(|b| (b.num_bins() - 1) as u8).collect();
 
         let num_rows = batch.num_rows();
         let mut scores = vec![self.base_score; num_rows];
@@ -95,14 +91,14 @@ impl Booster {
             Some(pool) => pool.install(|| {
                 scores.par_iter_mut().enumerate().for_each(|(row, score)| {
                     for tree in &self.trees {
-                        *score += tree.predict_row(row, &numeric_columns, &categorical_columns);
+                        *score += tree.predict_row(row, &column_refs, &sentinels);
                     }
                 });
             }),
             None => {
                 for (row, score) in scores.iter_mut().enumerate() {
                     for tree in &self.trees {
-                        *score += tree.predict_row(row, &numeric_columns, &categorical_columns);
+                        *score += tree.predict_row(row, &column_refs, &sentinels);
                     }
                 }
             }

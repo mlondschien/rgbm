@@ -1,13 +1,10 @@
 // Copyright (c) 2026 Malte Londschien
 // SPDX-License-Identifier: BSD-3-Clause
 
-use arrow::array::{Array, PrimitiveArray};
-use arrow::datatypes::Float64Type;
 use rayon::prelude::*;
 
-use crate::bin::FeatureBinner;
 use crate::dataset::Dataset;
-use crate::histogram::{BinSplit, Histograms, SplitInfo};
+use crate::histogram::{Histograms, SplitInfo, Threshold};
 use crate::parameters::BoosterParameters;
 use crate::histogram::calculate_score;
 
@@ -35,32 +32,6 @@ impl TreeWorkspace {
     }
 }
 
-#[derive(Clone)]
-pub enum Threshold {
-    Numeric(f64),
-    Categorical([u64; 4]),
-}
-
-impl Threshold {
-    pub fn from_bin_split(bin_split: &BinSplit, binner: &FeatureBinner) -> Self {
-        match bin_split {
-            BinSplit::Numeric(bin) => Threshold::Numeric(match binner {
-                FeatureBinner::Numerical(upper_bounds) => upper_bounds[*bin as usize],
-                FeatureBinner::Categorical(_) => panic!("numeric split on categorical feature"),
-            }),
-            BinSplit::Categorical(gl) => {
-                let mut bitset = [0u64; 4];
-                for (i, &goes_left) in gl.iter().enumerate() {
-                    if goes_left {
-                        bitset[i / 64] |= 1 << (i % 64);
-                    }
-                }
-                Threshold::Categorical(bitset)
-            }
-        }
-    }
-}
-
 /// Node in the decision tree, stored after training.
 #[derive(Clone)]
 #[repr(u8)]
@@ -72,7 +43,6 @@ pub enum Node {
         left_child: u32,
         right_child: u32,
         split_feature: u32,
-        missing_goes_left: bool,
         threshold: Threshold,
     },
 }
@@ -164,11 +134,7 @@ impl Tree {
                 left_child: left_node_idx as u32,
                 right_child: right_node_idx as u32,
                 split_feature: leaf.best_split.feature_index as u32,
-                missing_goes_left: leaf.best_split.missing_goes_left,
-                threshold: Threshold::from_bin_split(
-                    &leaf.best_split.threshold,
-                    &dataset.feature_binners[leaf.best_split.feature_index],
-                ),
+                threshold: leaf.best_split.threshold,
             };
             num_leaves += 1;
         }
@@ -181,12 +147,15 @@ impl Tree {
     }
 
     /// Zero-allocation, lock-free evaluation of a single row. For speed.
+    ///
+    /// `columns[f]` is the per-row binned values for feature `f`; `sentinels[f]` is
+    /// the bin index used to encode missing/null/NaN for that feature.
     #[inline(always)]
     pub fn predict_row(
         &self,
         row: usize,
-        numeric_columns: &[Option<&PrimitiveArray<Float64Type>>],
-        categorical_columns: &[Option<Vec<u8>>],
+        columns: &[&[u8]],
+        sentinels: &[u8],
     ) -> f64 {
         let mut idx = 0;
         loop {
@@ -196,28 +165,15 @@ impl Tree {
                     left_child,
                     right_child,
                     split_feature,
-                    missing_goes_left,
                     threshold,
                 } => {
+                    let bin = columns[*split_feature as usize][row];
                     let goes_left = match threshold {
-                        Threshold::Numeric(t) => {
-                            let col = numeric_columns[*split_feature as usize].unwrap();
-                            if col.is_null(row) {
-                                *missing_goes_left
-                            } else {
-                                let val = col.value(row);
-                                if val.is_nan() { *missing_goes_left } else { val <= *t }
-                            }
+                        Threshold::Numeric { bin: t, missing_goes_left } => {
+                            if bin == sentinels[*split_feature as usize] { *missing_goes_left }
+                            else { bin <= *t }
                         }
-                        Threshold::Categorical(bitset) => {
-                            let col = categorical_columns[*split_feature as usize].as_ref().unwrap();
-                            let bin = col[row] as usize;
-                            if bin < 256 {
-                                (bitset[bin / 64] >> (bin % 64)) & 1 == 1
-                            } else {
-                                *missing_goes_left
-                            }
-                        }
+                        Threshold::Categorical(cats) => cats[bin as usize],
                     };
                     idx = if goes_left { *left_child as usize } else { *right_child as usize };
                 }
@@ -283,15 +239,14 @@ impl Tree {
         let shift = (split.feature_index % 4) * 8;
         let bins = &bundle.packed_bins;
         let sentinel = (dataset.feature_binners[split.feature_index].num_bins() - 1) as u8;
-        let missing = split.missing_goes_left;
 
         let check_left = |row: u32| -> bool {
             let bin = ((bins[row as usize] >> shift) & 0xFF) as u8;
-            if bin == sentinel { missing } else {
-                match &split.threshold {
-                    BinSplit::Numeric(t) => bin <= *t as u8,
-                    BinSplit::Categorical(cats) => cats[bin as usize],
+            match &split.threshold {
+                Threshold::Numeric { bin: t, missing_goes_left } => {
+                    if bin == sentinel { *missing_goes_left } else { bin <= *t }
                 }
+                Threshold::Categorical(cats) => cats[bin as usize],
             }
         };
 
@@ -393,95 +348,86 @@ pub fn calculate_value(g: f64, h: f64, l1: f64, l2: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Float64Array;
 
     fn leaf(value: f64) -> Node {
         Node::Leaf { value }
     }
 
-    fn numeric_split(feature: usize, threshold: f64, left_child: usize, right_child: usize, missing_goes_left: bool) -> Node {
+    fn numeric_split(feature: usize, bin: u8, left_child: usize, right_child: usize, missing_goes_left: bool) -> Node {
         Node::Internal {
             left_child: left_child as u32,
             right_child: right_child as u32,
             split_feature: feature as u32,
-            threshold: Threshold::Numeric(threshold),
-            missing_goes_left,
+            threshold: Threshold::Numeric { bin, missing_goes_left },
         }
-    }
-
-    fn predict(tree: &Tree, numeric: &[Option<Float64Array>], categorical: &[Option<Vec<u8>>], row: usize) -> f64 {
-        let nc: Vec<Option<&PrimitiveArray<Float64Type>>> = numeric.iter().map(|a| a.as_ref().map(|a| a as _)).collect();
-        tree.predict_row(row, &nc, categorical)
     }
 
     #[test]
     fn test_predict_numeric_stump() {
-        // feature 0 <= 0.5 → -1.0, else → 1.0
+        // bin <= 5 → -1.0, else → 1.0. Sentinel = 9; bit unset → missing → right.
         let tree = Tree { nodes: vec![
-            numeric_split(0, 0.5, 1, 2, false),
+            numeric_split(0, 5, 1, 2, false),
             leaf(-1.0),
             leaf(1.0),
         ]};
-        let col = vec![Some(Float64Array::from(vec![0.0, 1.0]))];
-        let cat: Vec<Option<Vec<u8>>> = vec![None];
-        assert_eq!(predict(&tree, &col, &cat, 0), -1.0);
-        assert_eq!(predict(&tree, &col, &cat, 1),  1.0);
+        let col0: &[u8] = &[3, 7];
+        let cols = [col0];
+        let sentinels = [9u8];
+        assert_eq!(tree.predict_row(0, &cols, &sentinels), -1.0); // bin 3 → left
+        assert_eq!(tree.predict_row(1, &cols, &sentinels),  1.0); // bin 7 → right
     }
 
     #[test]
     fn test_predict_missing_goes_left() {
         let tree = Tree { nodes: vec![
-            numeric_split(0, 0.5, 1, 2, true),   // missing → left
+            numeric_split(0, 5, 1, 2, true),   // missing → left
             leaf(-1.0),
             leaf(1.0),
         ]};
-        // row 0: null → missing_goes_left → -1.0
-        let col = vec![Some(Float64Array::from(vec![None as Option<f64>]))];
-        let cat: Vec<Option<Vec<u8>>> = vec![None];
-        assert_eq!(predict(&tree, &col, &cat, 0), -1.0);
+        let col0: &[u8] = &[9]; // bin 9 = sentinel
+        let cols = [col0];
+        let sentinels = [9u8];
+        assert_eq!(tree.predict_row(0, &cols, &sentinels), -1.0);
     }
 
     #[test]
     fn test_predict_categorical() {
         // categories 0 and 2 go left, category 1 goes right
-        let mut bitset = [0u64; 4];
-        bitset[0] = (1 << 0) | (1 << 2);
-
         let tree = Tree { nodes: vec![
             Node::Internal {
                 left_child: 1,
                 right_child: 2,
                 split_feature: 0,
-                threshold: Threshold::Categorical(bitset),
-                missing_goes_left: false,
+                threshold: Threshold::Categorical(vec![true, false, true]),
             },
             leaf(-1.0),
             leaf(1.0),
         ]};
-        let num: Vec<Option<Float64Array>> = vec![None];
-        let cat = vec![Some(vec![0u8, 1, 2])]; // bin indices for rows 0, 1, 2
-        assert_eq!(predict(&tree, &num, &cat, 0), -1.0); // cat 0 → left
-        assert_eq!(predict(&tree, &num, &cat, 1),  1.0); // cat 1 → right
-        assert_eq!(predict(&tree, &num, &cat, 2), -1.0); // cat 2 → left
+        let col0: &[u8] = &[0, 1, 2];
+        let cols = [col0];
+        let sentinels = [3u8]; // unused for categorical
+        assert_eq!(tree.predict_row(0, &cols, &sentinels), -1.0); // cat 0 → left
+        assert_eq!(tree.predict_row(1, &cols, &sentinels),  1.0); // cat 1 → right
+        assert_eq!(tree.predict_row(2, &cols, &sentinels), -1.0); // cat 2 → left
     }
 
     #[test]
     fn test_predict_deep_tree() {
-        // feature 0 splits at 0.5; left child splits feature 1 at 0.5
-        // [0,0]→-2, [0,1]→-1, [1,*]→1
+        // f0 splits at bin 5; if left, f1 splits at bin 5
+        // [f0=3, f1=3]→-2, [f0=3, f1=7]→-1, [f0=7,*]→1
         let tree = Tree { nodes: vec![
-            numeric_split(0, 0.5, 1, 4, false),  // root: f0 <= 0.5 → node 1, else → node 4
-            numeric_split(1, 0.5, 2, 3, false),  // node 1: f1 <= 0.5 → node 2, else → node 3
+            numeric_split(0, 5, 1, 4, false),
+            numeric_split(1, 5, 2, 3, false),
             leaf(-2.0),
             leaf(-1.0),
             leaf(1.0),
         ]};
-        let f0 = Float64Array::from(vec![0.0, 0.0, 1.0]);
-        let f1 = Float64Array::from(vec![0.0, 1.0, 0.0]);
-        let col = vec![Some(f0), Some(f1)];
-        let cat: Vec<Option<Vec<u8>>> = vec![None, None];
-        assert_eq!(predict(&tree, &col, &cat, 0), -2.0);
-        assert_eq!(predict(&tree, &col, &cat, 1), -1.0);
-        assert_eq!(predict(&tree, &col, &cat, 2),  1.0);
+        let c0: &[u8] = &[3, 3, 7];
+        let c1: &[u8] = &[3, 7, 3];
+        let cols = [c0, c1];
+        let sentinels = [9u8, 9u8];
+        assert_eq!(tree.predict_row(0, &cols, &sentinels), -2.0);
+        assert_eq!(tree.predict_row(1, &cols, &sentinels), -1.0);
+        assert_eq!(tree.predict_row(2, &cols, &sentinels),  1.0);
     }
 }

@@ -23,16 +23,19 @@ impl HistogramBin {
     }
 }
 
+/// `Numeric { bin, missing_goes_left }`: rows with bin index `<= bin` go left.
+///  The sentinel/missing bin is routed by `missing_goes_left`.
+/// `Categorical(goes_left)`: one bool per bin. `goes_left[bin]` says which side
+///  the row goes. The sentinel bin's slot encodes missing routing.
 #[derive(Clone, Debug)]
-pub enum BinSplit {
-    Numeric(u32),
+pub enum Threshold {
+    Numeric { bin: u8, missing_goes_left: bool },
     Categorical(Vec<bool>),
 }
 
 pub struct SplitInfo {
     pub gain: f64,
-    pub missing_goes_left: bool,
-    pub threshold: BinSplit,
+    pub threshold: Threshold,
     pub feature_index: usize,
 }
 
@@ -355,8 +358,10 @@ impl Histograms {
 
         Some(SplitInfo {
             gain,
-            missing_goes_left: best_missing_goes_left,
-            threshold: BinSplit::Numeric(best_threshold as u32),
+            threshold: Threshold::Numeric {
+                bin: best_threshold as u8,
+                missing_goes_left: best_missing_goes_left,
+            },
             feature_index: 0, // to be filled in by caller
         })
     }
@@ -420,14 +425,12 @@ impl Histograms {
         for (i, &(_, k)) in categorical_order.iter().enumerate() {
             goes_left[k] = i <= best_threshold;
         }
-        // The sentinel/missing bin sits at num_bins - 1; mirror its bitset routing into
-        // missing_goes_left so serialization can emit it as the lgbm decision_type bit.
-        let best_missing_goes_left = goes_left[num_bins - 1];
+        // The sentinel/missing bin sits at num_bins - 1; its slot in `goes_left`
+        // is the source of truth for missing-value routing.
 
         Some(SplitInfo {
             gain,
-            missing_goes_left: best_missing_goes_left,
-            threshold: BinSplit::Categorical(goes_left),
+            threshold: Threshold::Categorical(goes_left),
             feature_index: 0, // to be filled in by caller
         })
     }
