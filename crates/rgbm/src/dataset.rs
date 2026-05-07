@@ -13,14 +13,13 @@ use crate::utils::build_thread_pool;
 /// This improves memory bandwidth in histogram builing.
 pub struct FeatureBundle {
     pub packed_bins: Vec<u32>,
-    pub feature_indices: Vec<usize>,
     pub num_bins: Vec<usize>,  // including the sentinel bin.
     pub is_categorical: Vec<bool>,
     pub count: usize, // number of features in the bundle.
 }
 
 impl FeatureBundle {
-    fn pack(binners: &[FeatureBinner], bins: &[Vec<u8>], feature_indices: Vec<usize>, num_rows: usize) -> Self {
+    fn pack(binners: &[FeatureBinner], bins: &[Vec<u8>], num_rows: usize) -> Self {
         let mut packed_bins = vec![0u32; num_rows];
         for (slot, col) in bins.iter().enumerate() {
             let shift = slot * 8;
@@ -30,7 +29,7 @@ impl FeatureBundle {
         }
         let num_bins: Vec<usize> = binners.iter().map(|b| b.num_bins()).collect();
         let is_categorical: Vec<bool> = binners.iter().map(|b| b.is_categorical()).collect();
-        Self { packed_bins, feature_indices, num_bins, is_categorical, count: binners.len() }
+        Self { packed_bins, num_bins, is_categorical, count: binners.len() }
     }
 }
 
@@ -42,12 +41,10 @@ pub struct Dataset {
     pub labels: Float64Array,
     pub weights: Option<Float64Array>,
     pub num_rows: usize,
-    pub num_features: usize,
 }
 
 impl Dataset {
     /// Build a `Dataset` from an Arrow `RecordBatch` of features plus separate label/weight arrays.
-    /// Todo: Handle weights.
     pub fn from_arrow(
         features: &RecordBatch,
         labels: &Float64Array,
@@ -85,13 +82,13 @@ impl Dataset {
                 (0..num_chunks).into_par_iter().map(|chunk_idx| {
                     let start = chunk_idx * 4;
                     let end = (start + 4).min(num_features);
-                    FeatureBundle::pack(&feature_binners[start..end], &all_bins[start..end], (start..end).collect(), num_rows)
+                    FeatureBundle::pack(&feature_binners[start..end], &all_bins[start..end], num_rows)
                 }).collect()
             }),
             None => (0..num_chunks).map(|chunk_idx| {
                 let start = chunk_idx * 4;
                 let end = (start + 4).min(num_features);
-                FeatureBundle::pack(&feature_binners[start..end], &all_bins[start..end], (start..end).collect(), num_rows)
+                FeatureBundle::pack(&feature_binners[start..end], &all_bins[start..end], num_rows)
             }).collect(),
         };
 
@@ -102,7 +99,6 @@ impl Dataset {
             labels: labels.clone(),
             weights: weights.cloned(),
             num_rows,
-            num_features,
         }
     }
 }
@@ -129,7 +125,7 @@ mod tests {
         let params = DatasetParameters { min_data_in_bin: 1, ..DatasetParameters::default() };
         let ds = Dataset::from_arrow(&make_features(), &labels, None, &params);
         assert_eq!(ds.num_rows, 5);
-        assert_eq!(ds.num_features, 1);
+        assert_eq!(ds.feature_binners.len(), 1);
         assert_eq!(ds.feature_names, vec!["x"]);
         assert_eq!(ds.labels, Float64Array::from(vec![0.0, 1.0, 0.0, 1.0, 0.0]));
     }
@@ -150,7 +146,7 @@ mod tests {
 
         let params = DatasetParameters { min_data_in_bin: 1, ..DatasetParameters::default() };
         let ds = Dataset::from_arrow(&features, &labels, None, &params);
-        assert_eq!(ds.num_features, 1);
+        assert_eq!(ds.feature_binners.len(), 1);
         assert!(matches!(ds.feature_binners[0], FeatureBinner::Categorical(_)));
         assert_eq!(ds.feature_binners[0].num_bins(), 4); // 3 categories + sentinel
     }
