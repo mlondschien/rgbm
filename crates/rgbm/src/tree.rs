@@ -91,9 +91,18 @@ impl Tree {
         let mut num_leaves = 1;
 
         while num_leaves < p.max_leaves && !active_leafs.is_empty() {
-            let (idx, _) = active_leafs.iter().enumerate().max_by(|(_, a), (_, b)| {
-                a.best_split.gain.total_cmp(&b.best_split.gain)
-            }).unwrap();
+            // Leaf-wise: highest-gain leaf first..
+            // Depth-first: shallowest leaf first, ties broken by highest gain
+            let (idx, _) = if p.leaf_wise {
+                active_leafs.iter().enumerate().max_by(|(_, a), (_, b)| {
+                    a.best_split.gain.total_cmp(&b.best_split.gain)
+                }).unwrap()
+            } else {
+                active_leafs.iter().enumerate().min_by(|(_, a), (_, b)| {
+                    a.depth.cmp(&b.depth)
+                        .then_with(|| b.best_split.gain.total_cmp(&a.best_split.gain))
+                }).unwrap()
+            };
             let leaf = active_leafs.swap_remove(idx);
 
             let split_position = self.partition_indices(

@@ -207,6 +207,38 @@ mod tests {
     }
 
     #[test]
+    fn test_fit_depth_first_balanced_tree() {
+        // With depth-first growth, max_depth=2, and max_leaves >= 4, the tree should
+        // expand fully at each level and end up with all 4 leaves at depth 2.
+        let n = 200;
+        let x: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
+        let y: Vec<f64> = x.iter().map(|&xi| if xi > 0.5 { 1.0 } else { 0.0 }).collect();
+        let (dataset, _) = make_dataset(x, y);
+
+        let params = BoosterParameters {
+            num_iterations: 1, max_depth: 2, max_leaves: 4, leaf_wise: false,
+            min_sum_hessian_in_leaf: 0.0, ..BoosterParameters::default()
+        };
+        let mut booster = Booster::new(params, Box::new(Gaussian));
+        booster.fit(&dataset);
+
+        // Walk the single tree and collect leaf depths.
+        let tree = &booster.trees[0];
+        let mut leaf_depths = Vec::new();
+        let mut stack = vec![(0usize, 0usize)]; // (node_idx, depth)
+        while let Some((idx, depth)) = stack.pop() {
+            match &tree.nodes[idx] {
+                crate::tree::Node::Leaf { .. } => leaf_depths.push(depth),
+                crate::tree::Node::Internal { left_child, right_child, .. } => {
+                    stack.push((*left_child as usize, depth + 1));
+                    stack.push((*right_child as usize, depth + 1));
+                }
+            }
+        }
+        assert_eq!(leaf_depths, vec![2; 4]);
+    }
+
+    #[test]
     fn test_fit_weighted() {
         // Two points: (0, 0) and (1, 1).
         // If we weight (0, 0) heavily, the base score (mean) should be close to 0.
