@@ -192,3 +192,63 @@ impl Objective for Probit {
         Self::norm_cdf(score)
     }
 }
+
+/// Poisson regression. Scores are log-rates: ``predict = exp(score)``.
+/// Labels are non-negative counts.
+pub struct Poisson;
+
+impl Objective for Poisson {
+    fn lgbm_name(&self) -> &str { "poisson" }
+
+    fn gradient_hessian(&self, labels: &[f64], scores: &[f64], weights: Option<&[f64]>, out: &mut [[f32; 2]], pool: Option<&rayon::ThreadPool>) {
+        match (pool, weights) {
+            (Some(pool), Some(weights)) => pool.install(|| {
+                out.par_iter_mut().zip(labels.par_iter()).zip(scores.par_iter()).zip(weights.par_iter())
+                    .for_each(|(((gh, &label), &score), &weight)| {
+                        let lambda = score.exp().min(1e30);
+                        gh[0] = ((lambda - label) * weight) as f32;
+                        gh[1] = (lambda * weight).max(1e-16) as f32;
+                    });
+            }),
+            (Some(pool), None) => pool.install(|| {
+                out.par_iter_mut().zip(labels.par_iter()).zip(scores.par_iter())
+                    .for_each(|((gh, &label), &score)| {
+                        let lambda = score.exp().min(1e30);
+                        gh[0] = (lambda - label) as f32;
+                        gh[1] = lambda.max(1e-16) as f32;
+                    });
+            }),
+            (None, Some(weights)) => {
+                for (((gh, &label), &score), &weight) in out.iter_mut().zip(labels).zip(scores).zip(weights) {
+                    let lambda = score.exp().min(1e30);
+                    gh[0] = ((lambda - label) * weight) as f32;
+                    gh[1] = (lambda * weight).max(1e-16) as f32;
+                }
+            }
+            (None, None) => {
+                for ((gh, &label), &score) in out.iter_mut().zip(labels).zip(scores) {
+                    let lambda = score.exp().min(1e30);
+                    gh[0] = (lambda - label) as f32;
+                    gh[1] = lambda.max(1e-16) as f32;
+                }
+            }
+        }
+    }
+
+    fn initial_score(&self, labels: &[f64], weights: Option<&[f64]>) -> f64 {
+        if labels.is_empty() { return 0.0; }
+        let mean = match weights {
+            Some(weights) => {
+                let (sum_wy, sum_w) = labels.iter().zip(weights.iter())
+                    .fold((0.0, 0.0), |(swy, sw), (&y, &w)| (swy + w * y, sw + w));
+                if sum_w > 0.0 { sum_wy / sum_w } else { 0.0 }
+            }
+            None => labels.iter().sum::<f64>() / labels.len() as f64
+        };
+        mean.max(1e-10).ln()
+    }
+
+    fn prediction(&self, score: f64) -> f64 {
+        score.exp()
+    }
+}

@@ -33,22 +33,24 @@ impl FeatureBundle {
     }
 }
 
-/// Training dataset: stores binned features, labels, and optional weights.
+/// Training dataset: stores binned features, labels, and optional weights / offsets.
 pub struct Dataset {
     pub feature_binners: Vec<FeatureBinner>,
     pub feature_bundles: Vec<FeatureBundle>,
     pub feature_names: Vec<String>,
     pub labels: Float64Array,
     pub weights: Option<Float64Array>,
+    pub offsets: Option<Float64Array>,
     pub num_rows: usize,
 }
 
 impl Dataset {
-    /// Build a `Dataset` from an Arrow `RecordBatch` of features plus separate label/weight arrays.
+    /// Build a `Dataset` from an Arrow `RecordBatch` of features plus separate label/weight/offsets arrays.
     pub fn from_arrow(
         features: &RecordBatch,
         labels: &Float64Array,
         weights: Option<&Float64Array>,
+        offsets: Option<&Float64Array>,
         params: &DatasetParameters,
     ) -> Self {
         let num_features = features.num_columns();
@@ -98,6 +100,7 @@ impl Dataset {
             feature_names,
             labels: labels.clone(),
             weights: weights.cloned(),
+            offsets: offsets.cloned(),
             num_rows,
         }
     }
@@ -123,7 +126,7 @@ mod tests {
     fn test_basic_dataset() {
         let labels = Float64Array::from(vec![0.0, 1.0, 0.0, 1.0, 0.0]);
         let params = DatasetParameters { min_data_in_bin: 1, ..DatasetParameters::default() };
-        let ds = Dataset::from_arrow(&make_features(), &labels, None, &params);
+        let ds = Dataset::from_arrow(&make_features(), &labels, None, None, &params);
         assert_eq!(ds.num_rows, 5);
         assert_eq!(ds.feature_binners.len(), 1);
         assert_eq!(ds.feature_names, vec!["x"]);
@@ -145,7 +148,7 @@ mod tests {
         let labels = Float64Array::from(vec![0.0, 1.0, 0.0, 1.0, 0.0]);
 
         let params = DatasetParameters { min_data_in_bin: 1, ..DatasetParameters::default() };
-        let ds = Dataset::from_arrow(&features, &labels, None, &params);
+        let ds = Dataset::from_arrow(&features, &labels, None, None, &params);
         assert_eq!(ds.feature_binners.len(), 1);
         assert!(matches!(ds.feature_binners[0], FeatureBinner::Categorical(_)));
         assert_eq!(ds.feature_binners[0].num_bins(), 4); // 3 categories + sentinel
