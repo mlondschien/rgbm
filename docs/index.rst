@@ -33,9 +33,9 @@ Quick start
 API Reference
 -------------
 
-.. autoclass:: rgbm.Dataset(x, y, weights=None, max_bin=255, min_data_in_bin=3, n_jobs=-1, seed=0)
+.. autoclass:: rgbm.Dataset
 
-.. autoclass:: rgbm.Booster(objective="gaussian", num_iterations=100, learning_rate=0.1, max_depth=6, min_sum_hessian_in_leaf=1e-3, min_gain_to_split=0.0, lambda_l1=0.0, lambda_l2=0.0, max_leaves=31, leaf_wise=True, n_jobs=-1)
+.. autoclass:: rgbm.Booster
    :members: fit, predict, model_to_string
 
 

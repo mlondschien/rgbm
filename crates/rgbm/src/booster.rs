@@ -40,7 +40,10 @@ impl Booster {
         let weights = dataset.weights.as_ref().map(|w| w.values().as_ref());
         self.base_score = self.objective.initial_score(labels, weights);
 
-        let mut scores = vec![self.base_score; dataset.num_rows];
+        let mut scores: Vec<f64> = match dataset.offsets.as_ref() {
+            Some(offsets) => offsets.values().iter().map(|&o| self.base_score + o).collect(),
+            None => vec![self.base_score; dataset.num_rows],
+        };
         let mut grad_hess = vec![[0.0f32; 2]; dataset.num_rows];
         let mut workspace = TreeWorkspace::new(dataset.num_rows);
 
@@ -74,7 +77,7 @@ impl Booster {
         }
     }
 
-    pub fn predict(&self, batch: &RecordBatch) -> Float64Array {
+    pub fn predict(&self, batch: &RecordBatch, offsets: Option<&Float64Array>) -> Float64Array {
         // Bin every column up-front. FeatureBinner::apply handles Float32 and the
         // various dictionary value types via internal casts.
         let columns: Vec<Vec<u8>> = self.feature_binners.iter().zip(batch.columns())
@@ -84,7 +87,10 @@ impl Booster {
         let sentinels: Vec<u8> = self.feature_binners.iter().map(|b| (b.num_bins() - 1) as u8).collect();
 
         let num_rows = batch.num_rows();
-        let mut scores = vec![self.base_score; num_rows];
+        let mut scores: Vec<f64> = match offsets {
+            Some(offsets) => offsets.values().iter().map(|&o| self.base_score + o).collect(),
+            None => vec![self.base_score; num_rows],
+        };
 
         let pool = build_thread_pool(self.parameters.n_jobs);
         match &pool {
@@ -115,14 +121,14 @@ mod tests {
     use arrow::array::Float64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use crate::dataset::Dataset;
-    use crate::objective::{Gaussian, Logistic, Probit};
+    use crate::objective::{Gaussian, Logistic, Poisson, Probit};
     use crate::parameters::{BoosterParameters, DatasetParameters};
 
     fn make_dataset(x: Vec<f64>, y: Vec<f64>) -> (Dataset, RecordBatch) {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(x))]).unwrap();
         let labels = Float64Array::from(y);
-        let dataset = Dataset::from_arrow(&batch, &labels, None, &DatasetParameters { min_data_in_bin: 1, ..DatasetParameters::default() });
+        let dataset = Dataset::from_arrow(&batch, &labels, None, None, &DatasetParameters { min_data_in_bin: 1, ..DatasetParameters::default() });
         (dataset, batch)
     }
 
@@ -154,7 +160,7 @@ mod tests {
 
         let mut booster = Booster::new(test_params(), Box::new(Gaussian));
         booster.fit(&dataset);
-        let preds = booster.predict(&batch);
+        let preds = booster.predict(&batch, None);
         assert!(mse(&preds, &y) < variance * 0.01);
     }
 
@@ -167,7 +173,7 @@ mod tests {
 
         let mut booster = Booster::new(test_params(), Box::new(Probit));
         booster.fit(&dataset);
-        let preds = booster.predict(&batch);
+        let preds = booster.predict(&batch, None);
 
         let correct = preds.values().iter().zip(&y)
             .filter(|&(&p, &yi)| (p > 0.5) == (yi > 0.5))
@@ -194,7 +200,7 @@ mod tests {
 
         let mut booster = Booster::new(test_params(), Box::new(Logistic));
         booster.fit(&dataset);
-        let preds = booster.predict(&batch);
+        let preds = booster.predict(&batch, None);
 
         let final_logloss = logloss(&preds, &y);
         assert!(final_logloss < initial_logloss * 0.1);
@@ -239,6 +245,31 @@ mod tests {
     }
 
     #[test]
+    fn test_fit_poisson() {
+        // Counts y_i ~ Poisson(rate(x_i)) with rate = exp(2x - 1).
+        // Booster trained with Poisson loss should recover predicted means
+        // close to the true rates on holdout-style queries.
+        let n = 500;
+        let x: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
+        let true_rate: Vec<f64> = x.iter().map(|&xi| (2.0 * xi - 1.0).exp()).collect();
+        // Deterministic "Poisson-like" labels: floor(rate) + parity. Good enough
+        // to exercise the loss; we only check that mean(predicted) ≈ mean(true).
+        let y: Vec<f64> = true_rate.iter().enumerate().map(|(i, &r)| r + ((i % 3) as f64 - 1.0) * 0.1).map(|v| v.max(0.0)).collect();
+        let (dataset, batch) = make_dataset(x, y.clone());
+
+        let mut booster = Booster::new(test_params(), Box::new(Poisson));
+        booster.fit(&dataset);
+        let preds = booster.predict(&batch, None);
+
+        // Predictions are non-negative.
+        assert!(preds.values().iter().all(|&p| p >= 0.0));
+        // Mean predicted rate matches mean of y closely.
+        let mean_y = y.iter().sum::<f64>() / n as f64;
+        let mean_pred = preds.values().iter().sum::<f64>() / n as f64;
+        assert!((mean_y - mean_pred).abs() < 0.05 * mean_y);
+    }
+
+    #[test]
     fn test_fit_weighted() {
         // Two points: (0, 0) and (1, 1).
         // If we weight (0, 0) heavily, the base score (mean) should be close to 0.
@@ -252,14 +283,14 @@ mod tests {
 
         // Weight first point heavily
         let weights1 = Float64Array::from(vec![100.0, 1.0]);
-        let ds1 = Dataset::from_arrow(&batch, &labels, Some(&weights1), &params);
+        let ds1 = Dataset::from_arrow(&batch, &labels, Some(&weights1), None, &params);
         let mut booster1 = Booster::new(test_params(), Box::new(Gaussian));
         booster1.fit(&ds1);
         assert!(booster1.base_score < 0.1);
 
         // Weight second point heavily
         let weights2 = Float64Array::from(vec![1.0, 100.0]);
-        let ds2 = Dataset::from_arrow(&batch, &labels, Some(&weights2), &params);
+        let ds2 = Dataset::from_arrow(&batch, &labels, Some(&weights2), None, &params);
         let mut booster2 = Booster::new(test_params(), Box::new(Gaussian));
         booster2.fit(&ds2);
         assert!(booster2.base_score > 0.9);
