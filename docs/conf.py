@@ -7,7 +7,12 @@ extensions = [
     "sphinx.ext.napoleon",
     "sphinx.ext.intersphinx",
     "sphinx_rtd_theme",
+    "nbsphinx",
 ]
+
+# Render the notebook from its committed outputs; do not re-execute on build
+# (the dataset isn't available on RTD).
+nbsphinx_execute = "never"
 
 intersphinx_mapping = {
     "numpy": ("https://numpy.org/doc/stable/", None),
