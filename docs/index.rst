@@ -19,17 +19,15 @@ Quick start
 .. code-block:: python
 
    import polars as pl
-   import pyarrow as pa
    import rgbm
 
    df = pl.read_csv("train.csv")
-   features = df.drop("y").to_arrow().to_batches()[0]
-   labels = pa.array(df["y"].to_numpy())
+   X, y = df.drop("y"), df["y"]
 
-   dataset = rgbm.Dataset(features, labels)
+   dataset = rgbm.Dataset(X, y)
    booster = rgbm.Booster(objective="gaussian", num_iterations=100)
    booster.fit(dataset)
-   predictions = booster.predict(features)
+   predictions = booster.predict(X)
 
 
 API Reference
@@ -39,6 +37,13 @@ API Reference
 
 .. autoclass:: rgbm.Booster
    :members: fit, predict, model_to_string
+
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Examples
+
+   Poisson regression with exposure <examples/french_motor_3rd_party_liabilities.ipynb>
 
 
 .. toctree::
