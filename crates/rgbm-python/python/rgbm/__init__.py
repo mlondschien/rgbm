@@ -14,9 +14,9 @@ __all__ = ["Dataset", "Booster"]
 def _to_record_batch(x):
     """Coerce ``x`` to ``pyarrow.RecordBatch``.
 
-    Accepts a ``pyarrow.RecordBatch`` directly, a ``pyarrow.Table``, or any
-    object exposing the Arrow PyCapsule interface (``__arrow_c_stream__``)
-    such as a polars ``DataFrame``.
+    Accepts a polars ``DataFrame`` (or any object exposing the Arrow
+    PyCapsule ``__arrow_c_stream__`` interface), a ``pyarrow.RecordBatch``,
+    or a ``pyarrow.Table``.
     """
     if isinstance(x, pa.RecordBatch):
         return x
@@ -33,8 +33,8 @@ def _to_record_batch(x):
 def _to_array(y):
     """Coerce ``y`` to ``pyarrow.Array`` (Float64).
 
-    Accepts a ``pyarrow.Array``, a numpy array, or anything ``np.asarray``
-    can convert (lists, polars Series, ...).
+    Accepts a polars ``Series``, a numpy array, a ``pyarrow.Array``, or
+    anything ``np.asarray`` can convert (lists, etc.).
     """
     if isinstance(y, pa.Array):
         return y
@@ -45,23 +45,21 @@ class Dataset:
     """A binned representation of a feature matrix and labels for training.
 
     Numerical columns are bucketed into ``max_bin`` bins via greedy quantile
-    binning. Categorical columns (Arrow ``Dictionary``) are mapped to bin
-    indices per category. Float32 numerical columns and dictionaries with
-    ``LargeUtf8`` / ``Utf8View`` values are accepted and cast internally.
+    binning. Categorical (Arrow ``Dictionary``) columns are mapped to bin
+    indices per category.
 
     Parameters
     ----------
-    x : pyarrow.RecordBatch, pyarrow.Table, or polars.DataFrame
-        Feature matrix. Each column must be Float64, Float32, or a Dictionary
-        with string-typed values (Utf8, LargeUtf8, or Utf8View).
-    y : pyarrow.Array, numpy.ndarray, or array-like
+    x : polars.DataFrame, pyarrow.RecordBatch, or pyarrow.Table
+        Feature matrix. Each column must be numerical (Float64 / Float32) or
+        Categorical (Arrow ``Dictionary`` with string values).
+    y : polars.Series, pyarrow.Array, or numpy.ndarray
         Float64 labels.
-    weights : array-like, optional
+    weights : polars.Series, pyarrow.Array, or numpy.ndarray, optional
         Per-row weights (Float64). Defaults to uniform weights.
-    offsets : array-like, optional
+    offsets : polars.Series, pyarrow.Array, or numpy.ndarray, optional
         Per-row baseline (Float64) added to the raw score during fit and
-        predict. For Poisson regression with exposure, set
-        ``offsets = log(exposure)``.
+        predict.
     max_bin : int, default 255
         Maximum number of bins per feature, including the missing/sentinel
         bin. Must satisfy ``max_bin <= 255``.
@@ -96,8 +94,7 @@ class Booster:
     objective : {"gaussian", "logistic", "probit", "poisson"}, default "gaussian"
         Loss function. ``gaussian`` for regression, ``logistic`` and
         ``probit`` for binary classification with labels in ``{0, 1}``,
-        ``poisson`` for non-negative count regression (typically combined
-        with ``offsets = log(exposure)`` on the Dataset and at predict).
+        ``poisson`` for non-negative count regression.
     num_iterations : int, default 100
         Number of boosting rounds (trees).
     learning_rate : float, default 0.1
@@ -167,10 +164,9 @@ class Booster:
 
         Parameters
         ----------
-        x : pyarrow.RecordBatch, pyarrow.Table, or polars.DataFrame
-            Feature matrix with the same schema as the training data. Float32
-            and non-Utf8 dictionary value types are cast internally.
-        offsets : array-like, optional
+        x : polars.DataFrame, pyarrow.RecordBatch, or pyarrow.Table
+            Feature matrix with the same schema as the training data.
+        offsets : polars.Series, pyarrow.Array, or numpy.ndarray, optional
             Per-row baseline (Float64) added to the raw score before applying
             the objective's link function.
 
