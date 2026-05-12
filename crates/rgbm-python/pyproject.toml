@@ -17,4 +17,5 @@ dependencies = [
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
-module-name = "rgbm"
+module-name = "rgbm._core"
+python-source = "python"
