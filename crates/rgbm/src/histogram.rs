@@ -72,7 +72,7 @@ impl Histograms {
 
 
     /// Build histograms for all features in a bundle in one pass over row_indices.
-    /// One 32-bit load per row replaces up to 4 separate byte loads.
+    /// One 64-bit load per row replaces up to 8 separate byte loads.
     /// SAFETY: bin values are in 0..num_bins[i] (sentinel is at index num_bins[i] - 1),
     /// histograms are sized num_bins[i].
     pub fn build_into(bundle: &FeatureBundle, packed_gh: &[[f32; 2]], row_indices: &[u32], bins: &mut [HistogramBin]) {
@@ -82,149 +82,103 @@ impl Histograms {
         // mid is even so the 2-way unrolled main loop has no remainder.
         let mid = (row_indices.len().saturating_sub(PREFETCH_DIST) / 2) * 2;
 
+        // Shared loop body for all bundle sizes. Pointers `p1..p7` and shift values
+        // are supplied per arm; `p0` is always the start of `bins`.
+        macro_rules! arm {
+            ($($pi:ident $shift:literal),* $(,)?) => {
+                let mut i = 0;
+                while i < mid {
+                    unsafe {
+                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST) as usize));
+                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST + 1) as usize));
+                        let row0 = *row_indices.get_unchecked(i) as usize;
+                        let row1 = *row_indices.get_unchecked(i + 1) as usize;
+                        let gh0 = *packed_gh.get_unchecked(i);
+                        let gh1 = *packed_gh.get_unchecked(i + 1);
+                        let pk0 = *bundle.packed_bins.get_unchecked(row0);
+                        let pk1 = *bundle.packed_bins.get_unchecked(row1);
+                        
+                        
+                        (*p0.add((pk0 & 0xFF) as usize)).add(gh0);
+                        // (*p1.add(((pk0 >> 8) & 0xFF) as usize)).add(gh0);                                                                                                                                      
+                        // ...
+                        // (*p7.add(((pk0 >> 56) & 0xFF) as usize)).add(gh0);
+                        $((*$pi.add(((pk0 >> $shift) & 0xFF) as usize)).add(gh0);)*
+
+                        (*p0.add((pk1 & 0xFF) as usize)).add(gh1);
+                        // (*p1.add(((pk1 >> 8) & 0xFF) as usize)).add(gh1);
+                        // ...                                                                                                                                   
+                        // (*p7.add(((pk1 >> 56) & 0xFF) as usize)).add(gh1); 
+                        $((*$pi.add(((pk1 >> $shift) & 0xFF) as usize)).add(gh1);)*
+                    }
+                    i += 2;
+                }
+                for i in mid..row_indices.len() {
+                    unsafe {
+                        let row = *row_indices.get_unchecked(i) as usize;
+                        let gh = *packed_gh.get_unchecked(i);
+                        let pk = *bundle.packed_bins.get_unchecked(row);
+                        (*p0.add((pk & 0xFF) as usize)).add(gh);
+                        $((*$pi.add(((pk >> $shift) & 0xFF) as usize)).add(gh);)*
+                    }
+                }
+            };
+        }
+
         match bundle.count {
+            8 => {
+                let p1 = unsafe { p0.add(bundle.num_bins[0]) };
+                let p2 = unsafe { p1.add(bundle.num_bins[1]) };
+                let p3 = unsafe { p2.add(bundle.num_bins[2]) };
+                let p4 = unsafe { p3.add(bundle.num_bins[3]) };
+                let p5 = unsafe { p4.add(bundle.num_bins[4]) };
+                let p6 = unsafe { p5.add(bundle.num_bins[5]) };
+                let p7 = unsafe { p6.add(bundle.num_bins[6]) };
+                arm!(p1 8, p2 16, p3 24, p4 32, p5 40, p6 48, p7 56);
+            }
+            7 => {
+                let p1 = unsafe { p0.add(bundle.num_bins[0]) };
+                let p2 = unsafe { p1.add(bundle.num_bins[1]) };
+                let p3 = unsafe { p2.add(bundle.num_bins[2]) };
+                let p4 = unsafe { p3.add(bundle.num_bins[3]) };
+                let p5 = unsafe { p4.add(bundle.num_bins[4]) };
+                let p6 = unsafe { p5.add(bundle.num_bins[5]) };
+                arm!(p1 8, p2 16, p3 24, p4 32, p5 40, p6 48);
+            }
+            6 => {
+                let p1 = unsafe { p0.add(bundle.num_bins[0]) };
+                let p2 = unsafe { p1.add(bundle.num_bins[1]) };
+                let p3 = unsafe { p2.add(bundle.num_bins[2]) };
+                let p4 = unsafe { p3.add(bundle.num_bins[3]) };
+                let p5 = unsafe { p4.add(bundle.num_bins[4]) };
+                arm!(p1 8, p2 16, p3 24, p4 32, p5 40);
+            }
+            5 => {
+                let p1 = unsafe { p0.add(bundle.num_bins[0]) };
+                let p2 = unsafe { p1.add(bundle.num_bins[1]) };
+                let p3 = unsafe { p2.add(bundle.num_bins[2]) };
+                let p4 = unsafe { p3.add(bundle.num_bins[3]) };
+                arm!(p1 8, p2 16, p3 24, p4 32);
+            }
             4 => {
                 let p1 = unsafe { p0.add(bundle.num_bins[0]) };
                 let p2 = unsafe { p1.add(bundle.num_bins[1]) };
                 let p3 = unsafe { p2.add(bundle.num_bins[2]) };
-
-                // with 2x unrolling and 4 features per chunk, data/pointers in one loop fit
-                // comfortably into modern CPU registers.
-                // Use index `i` instead of `iter_chunks()` to avoid zip.
-                let mut i = 0;
-                while i < mid {
-                    unsafe {
-                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST) as usize));
-                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST + 1) as usize));
-                        let row0 = *row_indices.get_unchecked(i) as usize;
-                        let row1 = *row_indices.get_unchecked(i + 1) as usize;
-                        let gh0 = *packed_gh.get_unchecked(i);
-                        let gh1 = *packed_gh.get_unchecked(i + 1);
-                        let pk0 = *bundle.packed_bins.get_unchecked(row0);
-                        let pk1 = *bundle.packed_bins.get_unchecked(row1);
-
-                        (*p0.add((pk0 & 0xFF) as usize)).add(gh0);
-                        (*p1.add(((pk0 >> 8) & 0xFF) as usize)).add(gh0);
-                        (*p2.add(((pk0 >> 16) & 0xFF) as usize)).add(gh0);
-                        (*p3.add((pk0 >> 24) as usize)).add(gh0);
-
-                        (*p0.add((pk1 & 0xFF) as usize)).add(gh1);
-                        (*p1.add(((pk1 >> 8) & 0xFF) as usize)).add(gh1);
-                        (*p2.add(((pk1 >> 16) & 0xFF) as usize)).add(gh1);
-                        (*p3.add((pk1 >> 24) as usize)).add(gh1);
-                    }
-                    i += 2;
-                }
-                for i in mid..row_indices.len() {
-                    unsafe {
-                        let row = *row_indices.get_unchecked(i) as usize;
-                        let gh = *packed_gh.get_unchecked(i);
-                        let pk = *bundle.packed_bins.get_unchecked(row);
-                        (*p0.add((pk & 0xFF) as usize)).add(gh);
-                        (*p1.add(((pk >> 8) & 0xFF) as usize)).add(gh);
-                        (*p2.add(((pk >> 16) & 0xFF) as usize)).add(gh);
-                        (*p3.add((pk >> 24) as usize)).add(gh);
-                    }
-                }
+                arm!(p1 8, p2 16, p3 24);
             }
             3 => {
                 let p1 = unsafe { p0.add(bundle.num_bins[0]) };
                 let p2 = unsafe { p1.add(bundle.num_bins[1]) };
-
-                let mut i = 0;
-                while i < mid {
-                    unsafe {
-                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST) as usize));
-                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST + 1) as usize));
-                        let row0 = *row_indices.get_unchecked(i) as usize;
-                        let row1 = *row_indices.get_unchecked(i + 1) as usize;
-                        let gh0 = *packed_gh.get_unchecked(i);
-                        let gh1 = *packed_gh.get_unchecked(i + 1);
-                        let pk0 = *bundle.packed_bins.get_unchecked(row0);
-                        let pk1 = *bundle.packed_bins.get_unchecked(row1);
-
-                        (*p0.add((pk0 & 0xFF) as usize)).add(gh0);
-                        (*p1.add(((pk0 >> 8) & 0xFF) as usize)).add(gh0);
-                        (*p2.add(((pk0 >> 16) & 0xFF) as usize)).add(gh0);
-
-                        (*p0.add((pk1 & 0xFF) as usize)).add(gh1);
-                        (*p1.add(((pk1 >> 8) & 0xFF) as usize)).add(gh1);
-                        (*p2.add(((pk1 >> 16) & 0xFF) as usize)).add(gh1);
-                    }
-                    i += 2;
-                }
-                for i in mid..row_indices.len() {
-                    unsafe {
-                        let row = *row_indices.get_unchecked(i) as usize;
-                        let gh = *packed_gh.get_unchecked(i);
-                        let pk = *bundle.packed_bins.get_unchecked(row);
-                        (*p0.add((pk & 0xFF) as usize)).add(gh);
-                        (*p1.add(((pk >> 8) & 0xFF) as usize)).add(gh);
-                        (*p2.add(((pk >> 16) & 0xFF) as usize)).add(gh);
-                    }
-                }
+                arm!(p1 8, p2 16);
             }
             2 => {
                 let p1 = unsafe { p0.add(bundle.num_bins[0]) };
-
-                let mut i = 0;
-                while i < mid {
-                    unsafe {
-                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST) as usize));
-                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST + 1) as usize));
-                        let row0 = *row_indices.get_unchecked(i) as usize;
-                        let row1 = *row_indices.get_unchecked(i + 1) as usize;
-                        let gh0 = *packed_gh.get_unchecked(i);
-                        let gh1 = *packed_gh.get_unchecked(i + 1);
-                        let pk0 = *bundle.packed_bins.get_unchecked(row0);
-                        let pk1 = *bundle.packed_bins.get_unchecked(row1);
-
-                        (*p0.add((pk0 & 0xFF) as usize)).add(gh0);
-                        (*p1.add(((pk0 >> 8) & 0xFF) as usize)).add(gh0);
-
-                        (*p0.add((pk1 & 0xFF) as usize)).add(gh1);
-                        (*p1.add(((pk1 >> 8) & 0xFF) as usize)).add(gh1);
-                    }
-                    i += 2;
-                }
-                for i in mid..row_indices.len() {
-                    unsafe {
-                        let row = *row_indices.get_unchecked(i) as usize;
-                        let gh = *packed_gh.get_unchecked(i);
-                        let pk = *bundle.packed_bins.get_unchecked(row);
-                        (*p0.add((pk & 0xFF) as usize)).add(gh);
-                        (*p1.add(((pk >> 8) & 0xFF) as usize)).add(gh);
-                    }
-                }
+                arm!(p1 8);
             }
             1 => {
-                let mut i = 0;
-                while i < mid {
-                    unsafe {
-                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST) as usize));
-                        prefetch(bundle.packed_bins.get_unchecked(*row_indices.get_unchecked(i + PREFETCH_DIST + 1) as usize));
-                        let row0 = *row_indices.get_unchecked(i) as usize;
-                        let row1 = *row_indices.get_unchecked(i + 1) as usize;
-                        let gh0 = *packed_gh.get_unchecked(i);
-                        let gh1 = *packed_gh.get_unchecked(i + 1);
-                        let pk0 = *bundle.packed_bins.get_unchecked(row0);
-                        let pk1 = *bundle.packed_bins.get_unchecked(row1);
-
-                        (*p0.add((pk0 & 0xFF) as usize)).add(gh0);
-                        (*p0.add((pk1 & 0xFF) as usize)).add(gh1);
-                    }
-                    i += 2;
-                }
-                for i in mid..row_indices.len() {
-                    unsafe {
-                        let row = *row_indices.get_unchecked(i) as usize;
-                        let gh = *packed_gh.get_unchecked(i);
-                        let pk = *bundle.packed_bins.get_unchecked(row);
-                        (*p0.add((pk & 0xFF) as usize)).add(gh);
-                    }
-                }
+                arm!();
             }
-            _ => unreachable!("Bundles must have between 1 and 4 features"),
+            _ => unreachable!("Bundles must have between 1 and 8 features"),
         }
     }
 

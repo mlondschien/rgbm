@@ -9,10 +9,10 @@ use crate::parameters::DatasetParameters;
 use crate::utils::build_thread_pool;
 
 /// FeatureBundle stores the features' bin indices.
-/// Bin values are u8. We pack up to 4 of these into a single u32 (1 byte).
-/// This improves memory bandwidth in histogram builing.
+/// Bin values are u8. We pack up to 8 of these into a single u64 (1 byte each).
+/// This improves memory bandwidth in histogram building.
 pub struct FeatureBundle {
-    pub packed_bins: Vec<u32>,
+    pub packed_bins: Vec<u64>,
     pub num_bins: Vec<usize>,  // including the sentinel bin.
     pub is_categorical: Vec<bool>,
     pub count: usize, // number of features in the bundle.
@@ -20,11 +20,11 @@ pub struct FeatureBundle {
 
 impl FeatureBundle {
     fn pack(binners: &[FeatureBinner], bins: &[Vec<u8>], num_rows: usize) -> Self {
-        let mut packed_bins = vec![0u32; num_rows];
+        let mut packed_bins = vec![0u64; num_rows];
         for (slot, col) in bins.iter().enumerate() {
             let shift = slot * 8;
             for row in 0..num_rows {
-                packed_bins[row] |= (col[row] as u32) << shift;
+                packed_bins[row] |= (col[row] as u64) << shift;
             }
         }
         let num_bins: Vec<usize> = binners.iter().map(|b| b.num_bins()).collect();
@@ -77,19 +77,19 @@ impl Dataset {
             }).unzip(),
         };
 
-        // Pack features into bundles of 4
-        let num_chunks = num_features.div_ceil(4);
+        // Pack features into bundles of 8
+        let num_chunks = num_features.div_ceil(8);
         let feature_bundles: Vec<FeatureBundle> = match &pool {
             Some(pool) => pool.install(|| {
                 (0..num_chunks).into_par_iter().map(|chunk_idx| {
-                    let start = chunk_idx * 4;
-                    let end = (start + 4).min(num_features);
+                    let start = chunk_idx * 8;
+                    let end = (start + 8).min(num_features);
                     FeatureBundle::pack(&feature_binners[start..end], &all_bins[start..end], num_rows)
                 }).collect()
             }),
             None => (0..num_chunks).map(|chunk_idx| {
-                let start = chunk_idx * 4;
-                let end = (start + 4).min(num_features);
+                let start = chunk_idx * 8;
+                let end = (start + 8).min(num_features);
                 FeatureBundle::pack(&feature_binners[start..end], &all_bins[start..end], num_rows)
             }).collect(),
         };

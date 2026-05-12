@@ -244,8 +244,8 @@ impl Tree {
         flags: &mut [bool],
     ) -> usize {
         let n = indices.len();
-        let bundle = &dataset.feature_bundles[split.feature_index / 4];
-        let shift = (split.feature_index % 4) * 8;
+        let bundle = &dataset.feature_bundles[split.feature_index / 8];
+        let shift = (split.feature_index % 8) * 8;
         let bins = &bundle.packed_bins;
         let sentinel = (dataset.feature_binners[split.feature_index].num_bins() - 1) as u8;
 
