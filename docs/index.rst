@@ -30,11 +30,11 @@ Quick start
    predictions = booster.predict(X)
 
 
-.. toctree::
-   :maxdepth: 2
-   :caption: API Reference
+.. autoclass:: rgbm.Dataset
 
-   api
+
+.. autoclass:: rgbm.Booster
+   :members: fit, predict, model_to_string
 
 
 .. toctree::
