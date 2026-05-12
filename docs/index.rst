@@ -30,6 +30,9 @@ Quick start
    predictions = booster.predict(X)
 
 
+API Reference
+-------------
+
 .. autoclass:: rgbm.Dataset
 
 
