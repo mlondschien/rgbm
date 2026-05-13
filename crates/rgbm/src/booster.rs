@@ -426,7 +426,10 @@ mod tests {
 
         for (p_no, p_with) in preds_no_off.values().iter().zip(preds_with_off.values()) {
             let ratio = p_with / p_no;
-            assert!((ratio - 2.0).abs() < 1e-9, "expected ratio == 2, got {ratio}");
+            assert!(
+                (ratio - 2.0).abs() < 1e-9,
+                "expected ratio == 2, got {ratio}"
+            );
         }
     }
 }

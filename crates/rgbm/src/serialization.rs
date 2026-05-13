@@ -248,12 +248,19 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(x))]).unwrap();
         let labels = Float64Array::from(y);
-        let params = DatasetParameters { min_data_in_bin: 1, ..DatasetParameters::default() };
+        let params = DatasetParameters {
+            min_data_in_bin: 1,
+            ..DatasetParameters::default()
+        };
         let dataset = Dataset::from_arrow(&batch, &labels, None, None, &params);
 
         let num_iterations = 5;
         let mut booster = Booster::new(
-            BoosterParameters { num_iterations, min_sum_hessian_in_leaf: 0.0, ..BoosterParameters::default() },
+            BoosterParameters {
+                num_iterations,
+                min_sum_hessian_in_leaf: 0.0,
+                ..BoosterParameters::default()
+            },
             Box::new(Gaussian),
         );
         booster.fit(&dataset);
@@ -268,7 +275,8 @@ mod tests {
         assert!(s.contains("objective=regression"));
 
         // One "Tree=N" header for the base-score tree + each fit tree.
-        let tree_headers = s.matches("\nTree=").count() + s.starts_with("Tree=").then_some(1).unwrap_or(0);
+        let tree_headers =
+            s.matches("\nTree=").count() + s.starts_with("Tree=").then_some(1).unwrap_or(0);
         // model_to_string puts Tree=N at start of each tree block; first one after the
         // header is "Tree=0" (base score), then "Tree=1".."Tree=num_iterations".
         assert_eq!(tree_headers, num_iterations + 1);

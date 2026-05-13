@@ -541,16 +541,27 @@ mod tests {
         // 10 rows, 1 numeric feature. Build dataset, then partition by bin <= some threshold.
         let values: Vec<f64> = (0..10).map(|i| i as f64).collect();
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, false)]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(values))]).unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(values))]).unwrap();
         let labels = Float64Array::from(vec![0.0; 10]);
-        let dataset = Dataset::from_arrow(&batch, &labels, None, None, &DatasetParameters {
-            min_data_in_bin: 1, ..DatasetParameters::default()
-        });
+        let dataset = Dataset::from_arrow(
+            &batch,
+            &labels,
+            None,
+            None,
+            &DatasetParameters {
+                min_data_in_bin: 1,
+                ..DatasetParameters::default()
+            },
+        );
 
         // Build a bin <= 4 split. Bins 0..=4 go left, others right.
         let split = SplitInfo {
             gain: 1.0,
-            threshold: Threshold::Numeric { bin: 4, missing_goes_left: false },
+            threshold: Threshold::Numeric {
+                bin: 4,
+                missing_goes_left: false,
+            },
             feature_index: 0,
         };
 
@@ -560,15 +571,29 @@ mod tests {
         let mut right_buf = vec![0u32; 10];
         let mut flags = vec![false; 10];
 
-        let n_left = tree.partition_indices(&dataset, &mut indices, &split, &mut left_buf, &mut right_buf, None, &mut flags);
+        let n_left = tree.partition_indices(
+            &dataset,
+            &mut indices,
+            &split,
+            &mut left_buf,
+            &mut right_buf,
+            None,
+            &mut flags,
+        );
 
         // Left rows must have feature-bin <= 4; right rows must have bin > 4.
         let bundle = &dataset.feature_bundles[0];
         for &row in &indices[..n_left] {
-            assert!((bundle.packed_bins[row as usize] & 0xFF) as u8 <= 4, "left row has bin > 4");
+            assert!(
+                (bundle.packed_bins[row as usize] & 0xFF) as u8 <= 4,
+                "left row has bin > 4"
+            );
         }
         for &row in &indices[n_left..] {
-            assert!((bundle.packed_bins[row as usize] & 0xFF) as u8 > 4, "right row has bin <= 4");
+            assert!(
+                (bundle.packed_bins[row as usize] & 0xFF) as u8 > 4,
+                "right row has bin <= 4"
+            );
         }
         assert_eq!(n_left + (10 - n_left), 10);
     }
