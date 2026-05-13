@@ -228,3 +228,52 @@ internal_count={zeros_internal}
         s.push_str("is_linear=0\nshrinkage=1\n");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dataset::Dataset;
+    use crate::objective::Gaussian;
+    use crate::parameters::{BoosterParameters, DatasetParameters};
+    use arrow::array::{Float64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_model_to_string_structure() {
+        // Fit a tiny booster and check structural invariants of the serialized model.
+        let n = 50;
+        let x: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
+        let y: Vec<f64> = x.iter().map(|&xi| 2.0 * xi).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(x))]).unwrap();
+        let labels = Float64Array::from(y);
+        let params = DatasetParameters { min_data_in_bin: 1, ..DatasetParameters::default() };
+        let dataset = Dataset::from_arrow(&batch, &labels, None, None, &params);
+
+        let num_iterations = 5;
+        let mut booster = Booster::new(
+            BoosterParameters { num_iterations, min_sum_hessian_in_leaf: 0.0, ..BoosterParameters::default() },
+            Box::new(Gaussian),
+        );
+        booster.fit(&dataset);
+
+        let s = booster.model_to_string();
+
+        // Top-level scaffolding.
+        assert!(s.starts_with("tree\nversion=v4\n"));
+        assert!(s.contains("end of trees\n"));
+        assert!(s.contains("end of parameters\n"));
+        assert!(s.ends_with("pandas_categorical:null\n"));
+        assert!(s.contains("objective=regression"));
+
+        // One "Tree=N" header for the base-score tree + each fit tree.
+        let tree_headers = s.matches("\nTree=").count() + s.starts_with("Tree=").then_some(1).unwrap_or(0);
+        // model_to_string puts Tree=N at start of each tree block; first one after the
+        // header is "Tree=0" (base score), then "Tree=1".."Tree=num_iterations".
+        assert_eq!(tree_headers, num_iterations + 1);
+
+        // Each tree section has exactly one num_leaves= line.
+        assert_eq!(s.matches("num_leaves=").count(), num_iterations + 1);
+    }
+}

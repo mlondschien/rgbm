@@ -371,6 +371,75 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_array() {
+        let arr = Float64Array::from(Vec::<f64>::new());
+        let binner = FeatureBinner::new(&arr, 255, 1, 0);
+        assert_eq!(binner.apply(&arr), Vec::<u8>::new());
+        // No data -> single (sentinel) bin via greedy_find_bins' empty-input branch.
+        assert_eq!(binner.num_bins(), 2);
+    }
+
+    #[test]
+    fn test_single_row() {
+        let arr = Float64Array::from(vec![42.0]);
+        let binner = FeatureBinner::new(&arr, 255, 1, 0);
+        let bins = binner.apply(&arr);
+        assert_eq!(bins.len(), 1);
+        // Sentinel is the last bin; the value should not be sentinel.
+        assert_ne!(bins[0], (binner.num_bins() - 1) as u8);
+    }
+
+    #[test]
+    fn test_all_null_column() {
+        // All-null Float64: every row maps to the sentinel.
+        let arr = Float64Array::from(vec![None as Option<f64>; 5]);
+        let binner = FeatureBinner::new(&arr, 255, 1, 0);
+        let bins = binner.apply(&arr);
+        let sentinel = (binner.num_bins() - 1) as u8;
+        assert!(bins.iter().all(|&b| b == sentinel));
+    }
+
+    #[test]
+    fn test_all_equal_values() {
+        // All rows with the same value: one valid bin + sentinel.
+        let arr = Float64Array::from(vec![7.5; 10]);
+        let binner = FeatureBinner::new(&arr, 255, 1, 0);
+        let bins = binner.apply(&arr);
+        assert!(bins.iter().all(|&b| b == bins[0]));
+        // Sentinel is a distinct value.
+        assert_ne!(bins[0], (binner.num_bins() - 1) as u8);
+    }
+
+    #[test]
+    #[should_panic(expected = "categorical feature has")]
+    fn test_too_many_categories_panics() {
+        // 255 categories > max_bin=255 (which permits at most max_bin-1 = 254 valid cats).
+        let cats: Vec<String> = (0..255).map(|i| format!("c{i}")).collect();
+        let cat_refs: Vec<&str> = cats.iter().map(|s| s.as_str()).collect();
+        let keys = UInt32Array::from((0..255u32).collect::<Vec<_>>());
+        let values = Arc::new(StringArray::from(cat_refs));
+        let dict = DictionaryArray::<UInt32Type>::try_new(keys, values).unwrap();
+        FeatureBinner::new(&dict, 255, 1, 0);
+    }
+
+    #[test]
+    fn test_int32_dict_keys() {
+        // pandas-style Dict<Int32, Utf8> (vs polars-style UInt32): also accepted via
+        // the as_any_dictionary() abstraction.
+        use arrow::array::Int32Array;
+        use arrow::datatypes::Int32Type;
+        let keys = Int32Array::from(vec![0i32, 1, 2, 0, 1]);
+        let values = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        let int_dict = DictionaryArray::<Int32Type>::try_new(keys, values).unwrap();
+        let utf8_dict = make_utf8_dict(&[0, 1, 2, 0, 1], &["a", "b", "c"]);
+
+        let int_binner = FeatureBinner::new(&int_dict, 255, 1, 0);
+        let utf8_binner = FeatureBinner::new(&utf8_dict, 255, 1, 0);
+        assert_eq!(int_binner.apply(&int_dict), utf8_binner.apply(&utf8_dict));
+        assert_eq!(int_binner.num_bins(), 4);
+    }
+
+    #[test]
     fn test_utf8_view_dict_via_cast() {
         // Newer-polars-style Dict<UInt32, Utf8View>: must bin the same as Dict<UInt32, Utf8>.
         let keys = UInt32Array::from(vec![0u32, 1, 2, 0, 1]);

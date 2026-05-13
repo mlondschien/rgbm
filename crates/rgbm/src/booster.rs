@@ -387,4 +387,46 @@ mod tests {
         booster2.fit(&ds2);
         assert!(booster2.base_score > 0.9);
     }
+
+    #[test]
+    fn test_determinism() {
+        // Fit twice with the same data and seed; predictions must be byte-identical.
+        let n = 200;
+        let x: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
+        let y: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 1.0).collect();
+        let (dataset, batch) = make_dataset(x, y);
+
+        let mut b1 = Booster::new(test_params(), Box::new(Gaussian));
+        b1.fit(&dataset);
+        let p1 = b1.predict(&batch, None);
+
+        let mut b2 = Booster::new(test_params(), Box::new(Gaussian));
+        b2.fit(&dataset);
+        let p2 = b2.predict(&batch, None);
+
+        assert_eq!(p1.values(), p2.values());
+    }
+
+    #[test]
+    fn test_offsets_scale_poisson_predictions() {
+        // Predict-time offsets must be added to scores before the link function.
+        // For Poisson (link = exp), passing offsets = log(2) at predict time must
+        // double the predictions versus predicting without offsets on the same model.
+        let n = 200;
+        let x: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
+        let y: Vec<f64> = x.iter().map(|&xi| (xi * 2.0).floor() + 1.0).collect();
+        let (dataset, batch) = make_dataset(x, y);
+
+        let mut booster = Booster::new(test_params(), Box::new(crate::objective::Poisson));
+        booster.fit(&dataset);
+
+        let preds_no_off = booster.predict(&batch, None);
+        let offsets = Float64Array::from(vec![2.0f64.ln(); n]);
+        let preds_with_off = booster.predict(&batch, Some(&offsets));
+
+        for (p_no, p_with) in preds_no_off.values().iter().zip(preds_with_off.values()) {
+            let ratio = p_with / p_no;
+            assert!((ratio - 2.0).abs() < 1e-9, "expected ratio == 2, got {ratio}");
+        }
+    }
 }
