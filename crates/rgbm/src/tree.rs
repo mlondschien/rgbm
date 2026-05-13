@@ -4,9 +4,9 @@
 use rayon::prelude::*;
 
 use crate::dataset::Dataset;
+use crate::histogram::calculate_score;
 use crate::histogram::{Histograms, SplitInfo, Threshold};
 use crate::parameters::BoosterParameters;
-use crate::histogram::calculate_score;
 
 /// Reusable scratch buffers for tree fitting, owned by the Booster and passed in each
 /// iteration to avoid repeated allocation of O(num_rows) memory.
@@ -75,39 +75,78 @@ pub struct Tree {
 
 impl Tree {
     pub fn new(max_leaves: usize) -> Self {
-        Self { nodes: Vec::with_capacity(2 * max_leaves) }
+        Self {
+            nodes: Vec::with_capacity(2 * max_leaves),
+        }
     }
 
-    pub fn fit(&mut self, dataset: &Dataset, grad_hess: &[[f32; 2]], p: &BoosterParameters, pool: Option<&rayon::ThreadPool>, workspace: &mut TreeWorkspace) {
+    pub fn fit(
+        &mut self,
+        dataset: &Dataset,
+        grad_hess: &[[f32; 2]],
+        p: &BoosterParameters,
+        pool: Option<&rayon::ThreadPool>,
+        workspace: &mut TreeWorkspace,
+    ) {
         self.nodes.clear();
 
-        for (i, x) in workspace.all_indices.iter_mut().enumerate() { *x = i as u32; }
+        for (i, x) in workspace.all_indices.iter_mut().enumerate() {
+            *x = i as u32;
+        }
 
         let mut active_leafs: Vec<ActiveLeaf> = Vec::new();
 
-        let root_histograms = Histograms::build(&dataset.feature_bundles, grad_hess, &workspace.all_indices, pool);
+        let root_histograms = Histograms::build(
+            &dataset.feature_bundles,
+            grad_hess,
+            &workspace.all_indices,
+            pool,
+        );
 
-        self.push_leaf(&mut active_leafs, &mut workspace.leaf_indices, &workspace.all_indices, root_histograms, 0, dataset.num_rows, 0, p, pool);
+        self.push_leaf(
+            &mut active_leafs,
+            &mut workspace.leaf_indices,
+            &workspace.all_indices,
+            root_histograms,
+            0,
+            dataset.num_rows,
+            0,
+            p,
+            pool,
+        );
         let mut num_leaves = 1;
 
         while num_leaves < p.max_leaves && !active_leafs.is_empty() {
             // Leaf-wise: highest-gain leaf first..
             // Depth-first: shallowest leaf first, ties broken by highest gain
             let (idx, _) = if p.leaf_wise {
-                active_leafs.iter().enumerate().max_by(|(_, a), (_, b)| {
-                    a.best_split.gain.total_cmp(&b.best_split.gain)
-                }).unwrap()
+                active_leafs
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.best_split.gain.total_cmp(&b.best_split.gain))
+                    .unwrap()
             } else {
-                active_leafs.iter().enumerate().min_by(|(_, a), (_, b)| {
-                    a.depth.cmp(&b.depth)
-                        .then_with(|| b.best_split.gain.total_cmp(&a.best_split.gain))
-                }).unwrap()
+                active_leafs
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        a.depth
+                            .cmp(&b.depth)
+                            .then_with(|| b.best_split.gain.total_cmp(&a.best_split.gain))
+                    })
+                    .unwrap()
             };
             let leaf = active_leafs.swap_remove(idx);
 
             let split_position = self.partition_indices(
-                dataset, &mut workspace.all_indices[leaf.start..leaf.start + leaf.len],
-                &leaf.best_split, &mut workspace.left_buffer, &mut workspace.right_buffer, pool, &mut workspace.partition_flags);
+                dataset,
+                &mut workspace.all_indices[leaf.start..leaf.start + leaf.len],
+                &leaf.best_split,
+                &mut workspace.left_buffer,
+                &mut workspace.right_buffer,
+                pool,
+                &mut workspace.partition_flags,
+            );
 
             let left_start = leaf.start;
             let left_len = split_position;
@@ -122,7 +161,12 @@ impl Tree {
                 for (out, &row) in ordered_grad_hess.iter_mut().zip(left_indices) {
                     *out = grad_hess[row as usize];
                 }
-                left_histograms = Histograms::build(&dataset.feature_bundles, ordered_grad_hess, left_indices, pool);
+                left_histograms = Histograms::build(
+                    &dataset.feature_bundles,
+                    ordered_grad_hess,
+                    left_indices,
+                    pool,
+                );
                 right_histograms = leaf.histograms;
                 right_histograms.subtract(&left_histograms);
             } else {
@@ -131,13 +175,38 @@ impl Tree {
                 for (out, &row) in ordered_grad_hess.iter_mut().zip(right_indices) {
                     *out = grad_hess[row as usize];
                 }
-                right_histograms = Histograms::build(&dataset.feature_bundles, ordered_grad_hess, right_indices, pool);
+                right_histograms = Histograms::build(
+                    &dataset.feature_bundles,
+                    ordered_grad_hess,
+                    right_indices,
+                    pool,
+                );
                 left_histograms = leaf.histograms;
                 left_histograms.subtract(&right_histograms);
             }
 
-            let left_node_idx = self.push_leaf(&mut active_leafs, &mut workspace.leaf_indices, &workspace.all_indices, left_histograms, left_start, left_len, leaf.depth + 1, p, pool);
-            let right_node_idx = self.push_leaf(&mut active_leafs, &mut workspace.leaf_indices, &workspace.all_indices, right_histograms, right_start, right_len, leaf.depth + 1, p, pool);
+            let left_node_idx = self.push_leaf(
+                &mut active_leafs,
+                &mut workspace.leaf_indices,
+                &workspace.all_indices,
+                left_histograms,
+                left_start,
+                left_len,
+                leaf.depth + 1,
+                p,
+                pool,
+            );
+            let right_node_idx = self.push_leaf(
+                &mut active_leafs,
+                &mut workspace.leaf_indices,
+                &workspace.all_indices,
+                right_histograms,
+                right_start,
+                right_len,
+                leaf.depth + 1,
+                p,
+                pool,
+            );
 
             self.nodes[leaf.leaf_index] = Node::Internal {
                 left_child: left_node_idx as u32,
@@ -160,12 +229,7 @@ impl Tree {
     /// `columns[f]` is the per-row binned values for feature `f`; `sentinels[f]` is
     /// the bin index used to encode missing/null/NaN for that feature.
     #[inline(always)]
-    pub fn predict_row(
-        &self,
-        row: usize,
-        columns: &[&[u8]],
-        sentinels: &[u8],
-    ) -> f64 {
+    pub fn predict_row(&self, row: usize, columns: &[&[u8]], sentinels: &[u8]) -> f64 {
         let mut idx = 0;
         loop {
             match unsafe { self.nodes.get_unchecked(idx) } {
@@ -178,13 +242,23 @@ impl Tree {
                 } => {
                     let bin = columns[*split_feature as usize][row];
                     let goes_left = match threshold {
-                        Threshold::Numeric { bin: t, missing_goes_left } => {
-                            if bin == sentinels[*split_feature as usize] { *missing_goes_left }
-                            else { bin <= *t }
+                        Threshold::Numeric {
+                            bin: t,
+                            missing_goes_left,
+                        } => {
+                            if bin == sentinels[*split_feature as usize] {
+                                *missing_goes_left
+                            } else {
+                                bin <= *t
+                            }
                         }
                         Threshold::Categorical(cats) => cats[bin as usize],
                     };
-                    idx = if goes_left { *left_child as usize } else { *right_child as usize };
+                    idx = if goes_left {
+                        *left_child as usize
+                    } else {
+                        *right_child as usize
+                    };
                 }
             }
         }
@@ -193,7 +267,7 @@ impl Tree {
     fn push_leaf(
         &mut self,
         active_leafs: &mut Vec<ActiveLeaf>,
-        leaf_indices: &mut Vec<u32>,
+        leaf_indices: &mut [u32],
         all_indices: &[u32],
         histograms: Histograms,
         start: usize,
@@ -203,9 +277,14 @@ impl Tree {
         pool: Option<&rayon::ThreadPool>,
     ) -> usize {
         // This returns 0 if there's no features.
-        let end = histograms.offsets.get(1).copied().unwrap_or(histograms.bins.len());
-        let (gradient, hessian) = histograms.bins[..end].iter()
-            .fold((0.0, 0.0), |(g, h), b| (g + b.sum_gradients, h + b.sum_hessians));
+        let end = histograms
+            .offsets
+            .get(1)
+            .copied()
+            .unwrap_or(histograms.bins.len());
+        let (gradient, hessian) = histograms.bins[..end].iter().fold((0.0, 0.0), |(g, h), b| {
+            (g + b.sum_gradients, h + b.sum_hessians)
+        });
         let score = calculate_score(gradient, hessian, p.lambda_l1, p.lambda_l2);
         let value = calculate_value(gradient, hessian, p.lambda_l1, p.lambda_l2) * p.learning_rate;
         let node_idx = self.nodes.len();
@@ -219,7 +298,14 @@ impl Tree {
         };
 
         match best_split {
-            Some(best_split) => active_leafs.push(ActiveLeaf { leaf_index: node_idx, start, len, depth, histograms, best_split }),
+            Some(best_split) => active_leafs.push(ActiveLeaf {
+                leaf_index: node_idx,
+                start,
+                len,
+                depth,
+                histograms,
+                best_split,
+            }),
             None => {
                 for &row in &all_indices[start..start + len] {
                     leaf_indices[row as usize] = node_idx as u32;
@@ -252,8 +338,15 @@ impl Tree {
         let check_left = |row: u32| -> bool {
             let bin = ((bins[row as usize] >> shift) & 0xFF) as u8;
             match &split.threshold {
-                Threshold::Numeric { bin: t, missing_goes_left } => {
-                    if bin == sentinel { *missing_goes_left } else { bin <= *t }
+                Threshold::Numeric {
+                    bin: t,
+                    missing_goes_left,
+                } => {
+                    if bin == sentinel {
+                        *missing_goes_left
+                    } else {
+                        bin <= *t
+                    }
                 }
                 Threshold::Categorical(cats) => cats[bin as usize],
             }
@@ -270,17 +363,21 @@ impl Tree {
 
             // (i) Write `check_left` into `flags` and get counts of left rows per chunk
             let counts: Vec<usize> = pool.install(|| {
-                indices.par_chunks(chunk_size)
+                indices
+                    .par_chunks(chunk_size)
                     .zip(flags[..n].par_chunks_mut(chunk_size))
                     .map(|(chunk, chunk_flags)| {
                         let mut count = 0;
                         for (j, &row) in chunk.iter().enumerate() {
                             let left = check_left(row);
                             chunk_flags[j] = left;
-                            if left { count += 1; }
+                            if left {
+                                count += 1;
+                            }
                         }
                         count
-                    }).collect()
+                    })
+                    .collect()
             });
 
             // (ii) Sequentially, prepare output slices based on `counts`. Use
@@ -294,7 +391,8 @@ impl Tree {
                 // this is chunk_size except for the last chunk, which may be smaller.
                 let chunk_length: usize = (i * chunk_size + chunk_size).min(n) - i * chunk_size;
                 let (left_current, left_tail) = left_remaining.split_at_mut(left_count);
-                let (right_current, right_tail) = right_remaining.split_at_mut(chunk_length - left_count);
+                let (right_current, right_tail) =
+                    right_remaining.split_at_mut(chunk_length - left_count);
                 left_slices.push(left_current);
                 right_slices.push(right_current);
                 left_remaining = left_tail;
@@ -304,7 +402,8 @@ impl Tree {
             // (iii) In parallel, fill the output buffers based on `flags`. Each chunk
             // writes to its output slice.
             pool.install(|| {
-                indices.par_chunks(chunk_size)
+                indices
+                    .par_chunks(chunk_size)
                     .zip(left_slices)
                     .zip(right_slices)
                     .zip(flags[..n].par_chunks(chunk_size))
@@ -353,7 +452,6 @@ pub fn calculate_value(g: f64, h: f64, l1: f64, l2: f64) -> f64 {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,37 +460,46 @@ mod tests {
         Node::Leaf { value }
     }
 
-    fn numeric_split(feature: usize, bin: u8, left_child: usize, right_child: usize, missing_goes_left: bool) -> Node {
+    fn numeric_split(
+        feature: usize,
+        bin: u8,
+        left_child: usize,
+        right_child: usize,
+        missing_goes_left: bool,
+    ) -> Node {
         Node::Internal {
             left_child: left_child as u32,
             right_child: right_child as u32,
             split_feature: feature as u32,
-            threshold: Threshold::Numeric { bin, missing_goes_left },
+            threshold: Threshold::Numeric {
+                bin,
+                missing_goes_left,
+            },
         }
     }
 
     #[test]
     fn test_predict_numeric_stump() {
         // bin <= 5 → -1.0, else → 1.0. Sentinel = 9; bit unset → missing → right.
-        let tree = Tree { nodes: vec![
-            numeric_split(0, 5, 1, 2, false),
-            leaf(-1.0),
-            leaf(1.0),
-        ]};
+        let tree = Tree {
+            nodes: vec![numeric_split(0, 5, 1, 2, false), leaf(-1.0), leaf(1.0)],
+        };
         let col0: &[u8] = &[3, 7];
         let cols = [col0];
         let sentinels = [9u8];
         assert_eq!(tree.predict_row(0, &cols, &sentinels), -1.0); // bin 3 → left
-        assert_eq!(tree.predict_row(1, &cols, &sentinels),  1.0); // bin 7 → right
+        assert_eq!(tree.predict_row(1, &cols, &sentinels), 1.0); // bin 7 → right
     }
 
     #[test]
     fn test_predict_missing_goes_left() {
-        let tree = Tree { nodes: vec![
-            numeric_split(0, 5, 1, 2, true),   // missing → left
-            leaf(-1.0),
-            leaf(1.0),
-        ]};
+        let tree = Tree {
+            nodes: vec![
+                numeric_split(0, 5, 1, 2, true), // missing → left
+                leaf(-1.0),
+                leaf(1.0),
+            ],
+        };
         let col0: &[u8] = &[9]; // bin 9 = sentinel
         let cols = [col0];
         let sentinels = [9u8];
@@ -402,21 +509,23 @@ mod tests {
     #[test]
     fn test_predict_categorical() {
         // categories 0 and 2 go left, category 1 goes right
-        let tree = Tree { nodes: vec![
-            Node::Internal {
-                left_child: 1,
-                right_child: 2,
-                split_feature: 0,
-                threshold: Threshold::Categorical(vec![true, false, true]),
-            },
-            leaf(-1.0),
-            leaf(1.0),
-        ]};
+        let tree = Tree {
+            nodes: vec![
+                Node::Internal {
+                    left_child: 1,
+                    right_child: 2,
+                    split_feature: 0,
+                    threshold: Threshold::Categorical(vec![true, false, true]),
+                },
+                leaf(-1.0),
+                leaf(1.0),
+            ],
+        };
         let col0: &[u8] = &[0, 1, 2];
         let cols = [col0];
         let sentinels = [3u8]; // unused for categorical
         assert_eq!(tree.predict_row(0, &cols, &sentinels), -1.0); // cat 0 → left
-        assert_eq!(tree.predict_row(1, &cols, &sentinels),  1.0); // cat 1 → right
+        assert_eq!(tree.predict_row(1, &cols, &sentinels), 1.0); // cat 1 → right
         assert_eq!(tree.predict_row(2, &cols, &sentinels), -1.0); // cat 2 → left
     }
 
@@ -424,19 +533,21 @@ mod tests {
     fn test_predict_deep_tree() {
         // f0 splits at bin 5; if left, f1 splits at bin 5
         // [f0=3, f1=3]→-2, [f0=3, f1=7]→-1, [f0=7,*]→1
-        let tree = Tree { nodes: vec![
-            numeric_split(0, 5, 1, 4, false),
-            numeric_split(1, 5, 2, 3, false),
-            leaf(-2.0),
-            leaf(-1.0),
-            leaf(1.0),
-        ]};
+        let tree = Tree {
+            nodes: vec![
+                numeric_split(0, 5, 1, 4, false),
+                numeric_split(1, 5, 2, 3, false),
+                leaf(-2.0),
+                leaf(-1.0),
+                leaf(1.0),
+            ],
+        };
         let c0: &[u8] = &[3, 3, 7];
         let c1: &[u8] = &[3, 7, 3];
         let cols = [c0, c1];
         let sentinels = [9u8, 9u8];
         assert_eq!(tree.predict_row(0, &cols, &sentinels), -2.0);
         assert_eq!(tree.predict_row(1, &cols, &sentinels), -1.0);
-        assert_eq!(tree.predict_row(2, &cols, &sentinels),  1.0);
+        assert_eq!(tree.predict_row(2, &cols, &sentinels), 1.0);
     }
 }

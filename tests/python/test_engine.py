@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 #
 # Tests adapted from LightGBM's tests/python_package_test/test_engine.py for the
-# subset of features rgbm implements. 
+# subset of features rgbm implements.
 #
 # rgbm has no `min_data_in_leaf`. Where lgbm relies on its default of 20
 # (e.g. test_binary on a small dataset), we substitute
@@ -30,9 +30,13 @@ def _f64(arr):
 
 def test_binary():
     X, y = load_breast_cancer(return_X_y=True)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.1, random_state=42
+    )
     m = rgbm.Booster(
-        objective="logistic", num_iterations=50, min_sum_hessian_in_leaf=5.0,
+        objective="logistic",
+        num_iterations=50,
+        min_sum_hessian_in_leaf=5.0,
     )
     m.fit(rgbm.Dataset(_to_batch(X_train), _f64(y_train)))
     preds = np.asarray(m.predict(_to_batch(X_test)))
@@ -41,9 +45,13 @@ def test_binary():
 
 def test_regression():
     # Same data as lgbm's tests/utils.py::make_synthetic_regression.
-    X, y = make_regression(n_samples=100, n_features=4, n_informative=2, random_state=42)
+    X, y = make_regression(
+        n_samples=100, n_features=4, n_informative=2, random_state=42
+    )
     y = np.abs(y)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.1, random_state=42
+    )
     m = rgbm.Booster(objective="gaussian", num_iterations=50)
     m.fit(rgbm.Dataset(_to_batch(X_train), _f64(y_train)))
     preds = np.asarray(m.predict(_to_batch(X_test)))
@@ -85,7 +93,10 @@ def test_missing_value_handle_na():
     y = np.array([1, 1, 1, 1, 0, 0, 0, 0, 1], dtype=np.float64)
     batch = _to_batch(x)
     m = rgbm.Booster(
-        objective="gaussian", num_iterations=1, learning_rate=1.0, max_leaves=2,
+        objective="gaussian",
+        num_iterations=1,
+        learning_rate=1.0,
+        max_leaves=2,
     )
     m.fit(rgbm.Dataset(batch, _f64(y), min_data_in_bin=1))
     preds = np.asarray(m.predict(batch))
@@ -99,7 +110,10 @@ def test_categorical_handle():
     y = np.array([0, 1, 0, 1, 0, 1, 0, 1], dtype=np.float64)
     batch = pa.record_batch({"cat": cats})
     m = rgbm.Booster(
-        objective="gaussian", num_iterations=1, learning_rate=1.0, max_leaves=2,
+        objective="gaussian",
+        num_iterations=1,
+        learning_rate=1.0,
+        max_leaves=2,
     )
     m.fit(rgbm.Dataset(batch, _f64(y), min_data_in_bin=1))
     preds = np.asarray(m.predict(batch))
@@ -111,22 +125,30 @@ def test_categorical_handle_na():
     y = np.array([0, 1, 0, 1, 0, 1], dtype=np.float64)
     batch = pa.record_batch({"cat": cats})
     m = rgbm.Booster(
-        objective="gaussian", num_iterations=1, learning_rate=1.0, max_leaves=2,
+        objective="gaussian",
+        num_iterations=1,
+        learning_rate=1.0,
+        max_leaves=2,
     )
     m.fit(rgbm.Dataset(batch, _f64(y), min_data_in_bin=1))
     preds = np.asarray(m.predict(batch))
     np.testing.assert_allclose(preds, y)
 
 
-@pytest.mark.parametrize("y_true,expected", [
-    ([0.0, 10.0, 0.0, 10.0], 5.0),
-    ([0.0, 1.0, 2.0, 3.0], 1.5),
-    ([-1.0, 1.0, -2.0, 2.0], 0.0),
-])
+@pytest.mark.parametrize(
+    "y_true,expected",
+    [
+        ([0.0, 10.0, 0.0, 10.0], 5.0),
+        ([0.0, 1.0, 2.0, 3.0], 1.5),
+        ([-1.0, 1.0, -2.0, 2.0], 0.0),
+    ],
+)
 def test_constant_features_regression(y_true, expected):
     X = np.ones((len(y_true), 1))
     batch = _to_batch(X)
-    m = rgbm.Booster(objective="gaussian", num_iterations=2, learning_rate=1.0, max_leaves=2)
+    m = rgbm.Booster(
+        objective="gaussian", num_iterations=2, learning_rate=1.0, max_leaves=2
+    )
     m.fit(rgbm.Dataset(batch, _f64(y_true), min_data_in_bin=1))
     preds = np.asarray(m.predict(batch))
     np.testing.assert_allclose(preds, expected)

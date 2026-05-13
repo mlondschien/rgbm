@@ -3,18 +3,19 @@
 
 //! LightGBM `model.txt` (v4) compatible serialization.
 
-use std::fmt::Write;
 use crate::bin::FeatureBinner;
 use crate::booster::Booster;
 use crate::histogram::Threshold;
 use crate::tree::{Node, Tree};
+use std::fmt::Write;
 
 impl Booster {
     pub fn model_to_string(&self) -> String {
         // LightGBM has no `base_score` field, instead it prepends a 1-leaf tree with
         // leaf-value = base_score. We do the same.
         let mut tree_texts: Vec<String> = Vec::with_capacity(self.trees.len() + 1);
-        tree_texts.push(format!("\
+        tree_texts.push(format!(
+            "\
 Tree=0
 num_leaves=1
 num_cat=0
@@ -34,7 +35,9 @@ is_linear=0
 shrinkage=1
 
 
-", value = self.base_score));
+",
+            value = self.base_score
+        ));
 
         for (i, tree) in self.trees.iter().enumerate() {
             let mut t = format!("Tree={}\n", i + 1);
@@ -43,23 +46,29 @@ shrinkage=1
             tree_texts.push(t);
         }
 
-        let feature_infos: Vec<String> = self.feature_binners.iter().map(|b| match b {
-            FeatureBinner::Numerical(_) => {
-                "[-inf:inf]".to_string()
-            }
-            FeatureBinner::Categorical(map) => {
-                std::iter::once("-1".to_string())
+        let feature_infos: Vec<String> = self
+            .feature_binners
+            .iter()
+            .map(|b| match b {
+                FeatureBinner::Numerical(_) => "[-inf:inf]".to_string(),
+                FeatureBinner::Categorical(map) => std::iter::once("-1".to_string())
                     .chain((0..map.len()).map(|i| i.to_string()))
-                    .collect::<Vec<_>>().join(":")
-            }
-        }).collect();
+                    .collect::<Vec<_>>()
+                    .join(":"),
+            })
+            .collect();
 
         let objective_name = self.objective.lgbm_name();
         let max_feature_indices = self.feature_binners.len() - 1;
         let feature_names = self.feature_names.join(" ");
         let feature_infos = feature_infos.join(" ");
-        let tree_sizes = tree_texts.iter().map(|t| t.len().to_string()).collect::<Vec<_>>().join(" ");
-        let mut s = format!("\
+        let tree_sizes = tree_texts
+            .iter()
+            .map(|t| t.len().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut s = format!(
+            "\
 tree
 version=v4
 num_class=1
@@ -73,8 +82,12 @@ tree_sizes={tree_sizes}
 
 ",
         );
-        for t in &tree_texts { s.push_str(t); }
-        write!(s, "\
+        for t in &tree_texts {
+            s.push_str(t);
+        }
+        write!(
+            s,
+            "\
 end of trees
 
 parameters:
@@ -85,7 +98,9 @@ parameters:
 end of parameters
 
 pandas_categorical:null
-").unwrap();
+"
+        )
+        .unwrap();
         s
     }
 }
@@ -98,7 +113,10 @@ impl Tree {
         let mut n_internal = 0i32;
         for (i, node) in self.nodes.iter().enumerate() {
             match node {
-                Node::Internal { .. } => { node_idx[i] = n_internal; n_internal += 1; }
+                Node::Internal { .. } => {
+                    node_idx[i] = n_internal;
+                    n_internal += 1;
+                }
                 Node::Leaf { value } => {
                     node_idx[i] = -(leaf_values.len() as i32 + 1);
                     leaf_values.push(*value);
@@ -115,7 +133,15 @@ impl Tree {
         let mut cat_boundaries: Vec<usize> = vec![0];
 
         for node in &self.nodes {
-            let Node::Internal { left_child: lc, right_child: rc, split_feature: sf, threshold: t } = node else { continue };
+            let Node::Internal {
+                left_child: lc,
+                right_child: rc,
+                split_feature: sf,
+                threshold: t,
+            } = node
+            else {
+                continue;
+            };
             split_feature.push(*sf);
             left_child.push(node_idx[*lc as usize]);
             right_child.push(node_idx[*rc as usize]);
@@ -123,9 +149,16 @@ impl Tree {
             // bit 0: categorical, bit 1: default_left, bits 2-3: missing_type (NaN=2)
             let mut d = 8u8;
             match t {
-                Threshold::Numeric { bin, missing_goes_left } => {
-                    if *missing_goes_left { d |= 2; }
-                    let FeatureBinner::Numerical(upper_bounds) = &binners[*sf as usize] else { unreachable!() };
+                Threshold::Numeric {
+                    bin,
+                    missing_goes_left,
+                } => {
+                    if *missing_goes_left {
+                        d |= 2;
+                    }
+                    let FeatureBinner::Numerical(upper_bounds) = &binners[*sf as usize] else {
+                        unreachable!()
+                    };
                     threshold.push(upper_bounds[*bin as usize]);
                 }
                 Threshold::Categorical(cats) => {
@@ -133,7 +166,9 @@ impl Tree {
                     // cats[sentinel_bin] encodes missing routing; lgbm conveys that via
                     // the decision_type bit, so we skip that slot when packing.
                     let sentinel_bin = cats.len() - 1;
-                    if cats[sentinel_bin] { d |= 2; }
+                    if cats[sentinel_bin] {
+                        d |= 2;
+                    }
                     threshold.push((cat_boundaries.len() - 1) as f64);
                     // Pack directly into the lgbm cat_threshold format (8 u32 words = 256 bits).
                     let start = cat_thresholds.len();
@@ -150,11 +185,16 @@ impl Tree {
         }
 
         fn join<T: std::fmt::Display>(v: &[T]) -> String {
-            v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ")
+            v.iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
         }
         let n_internal = split_feature.len();
         let n_leaf = leaf_values.len();
-        write!(s, "\
+        write!(
+            s,
+            "\
 num_leaves={n_leaf}
 num_cat={n_cat}
 split_feature={split_feature}
@@ -179,7 +219,8 @@ internal_count={zeros_internal}
             leaf_value = join(&leaf_values),
             zeros_internal = join(&vec![0u8; n_internal]),
             zeros_leaf = join(&vec![0u8; n_leaf]),
-        ).unwrap();
+        )
+        .unwrap();
         if !cat_thresholds.is_empty() {
             writeln!(s, "cat_boundaries={}", join(&cat_boundaries)).unwrap();
             writeln!(s, "cat_threshold={}", join(&cat_thresholds)).unwrap();

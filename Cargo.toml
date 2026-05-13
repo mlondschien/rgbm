@@ -5,6 +5,11 @@ members = [
 ]
 resolver = "2"
 
+[workspace.lints.clippy]
+# Stylistic lints we don't care to chase across the codebase.
+too_many_arguments = "allow"     # tree fitters legitimately share lots of workspace state
+needless_range_loop = "allow"    # explicit indexing reads more clearly in hot histogram loops
+
 [workspace.dependencies]
 arrow = { version = "54" }
 rayon = "1.10"
