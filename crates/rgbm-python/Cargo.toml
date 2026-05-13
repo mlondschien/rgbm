@@ -16,3 +16,6 @@ rgbm = { path = "../rgbm" }
 arrow = { workspace = true, features = ["pyarrow"] }
 pyo3 = { workspace = true }
 numpy = { workspace = true }
+
+[lints]
+workspace = true
