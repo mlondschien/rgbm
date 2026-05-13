@@ -24,5 +24,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: pip install maturin pytest numpy pyarrow polars scikit-learn lightgbm
-      - run: maturin develop --release --manifest-path crates/rgbm-python/Cargo.toml
+      - run: maturin build --release --manifest-path crates/rgbm-python/Cargo.toml --out dist
+      - run: pip install dist/*.whl
       - run: pytest tests/python -v
