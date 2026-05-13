@@ -13,7 +13,7 @@ use crate::utils::build_thread_pool;
 /// This improves memory bandwidth in histogram building.
 pub struct FeatureBundle {
     pub packed_bins: Vec<u64>,
-    pub num_bins: Vec<usize>,  // including the sentinel bin.
+    pub num_bins: Vec<usize>, // including the sentinel bin.
     pub is_categorical: Vec<bool>,
     pub count: usize, // number of features in the bundle.
 }
@@ -29,7 +29,12 @@ impl FeatureBundle {
         }
         let num_bins: Vec<usize> = binners.iter().map(|b| b.num_bins()).collect();
         let is_categorical: Vec<bool> = binners.iter().map(|b| b.is_categorical()).collect();
-        Self { packed_bins, num_bins, is_categorical, count: binners.len() }
+        Self {
+            packed_bins,
+            num_bins,
+            is_categorical,
+            count: binners.len(),
+        }
     }
 }
 
@@ -56,7 +61,10 @@ impl Dataset {
         let num_features = features.num_columns();
         let num_rows = features.num_rows();
 
-        let feature_names: Vec<String> = features.schema().fields().iter()
+        let feature_names: Vec<String> = features
+            .schema()
+            .fields()
+            .iter()
             .map(|f| f.name().clone())
             .collect();
 
@@ -64,34 +72,65 @@ impl Dataset {
 
         let (feature_binners, all_bins): (Vec<_>, Vec<_>) = match &pool {
             Some(pool) => pool.install(|| {
-                features.columns().par_iter().map(|array| {
-                    let binner = FeatureBinner::new(array.as_ref(), params.max_bin, params.min_data_in_bin, params.seed);
+                features
+                    .columns()
+                    .par_iter()
+                    .map(|array| {
+                        let binner = FeatureBinner::new(
+                            array.as_ref(),
+                            params.max_bin,
+                            params.min_data_in_bin,
+                            params.seed,
+                        );
+                        let bins = binner.apply(array.as_ref());
+                        (binner, bins)
+                    })
+                    .unzip()
+            }),
+            None => features
+                .columns()
+                .iter()
+                .map(|array| {
+                    let binner = FeatureBinner::new(
+                        array.as_ref(),
+                        params.max_bin,
+                        params.min_data_in_bin,
+                        params.seed,
+                    );
                     let bins = binner.apply(array.as_ref());
                     (binner, bins)
-                }).unzip()
-            }),
-            None => features.columns().iter().map(|array| {
-                let binner = FeatureBinner::new(array.as_ref(), params.max_bin, params.min_data_in_bin, params.seed);
-                let bins = binner.apply(array.as_ref());
-                (binner, bins)
-            }).unzip(),
+                })
+                .unzip(),
         };
 
         // Pack features into bundles of 8
         let num_chunks = num_features.div_ceil(8);
         let feature_bundles: Vec<FeatureBundle> = match &pool {
             Some(pool) => pool.install(|| {
-                (0..num_chunks).into_par_iter().map(|chunk_idx| {
+                (0..num_chunks)
+                    .into_par_iter()
+                    .map(|chunk_idx| {
+                        let start = chunk_idx * 8;
+                        let end = (start + 8).min(num_features);
+                        FeatureBundle::pack(
+                            &feature_binners[start..end],
+                            &all_bins[start..end],
+                            num_rows,
+                        )
+                    })
+                    .collect()
+            }),
+            None => (0..num_chunks)
+                .map(|chunk_idx| {
                     let start = chunk_idx * 8;
                     let end = (start + 8).min(num_features);
-                    FeatureBundle::pack(&feature_binners[start..end], &all_bins[start..end], num_rows)
-                }).collect()
-            }),
-            None => (0..num_chunks).map(|chunk_idx| {
-                let start = chunk_idx * 8;
-                let end = (start + 8).min(num_features);
-                FeatureBundle::pack(&feature_binners[start..end], &all_bins[start..end], num_rows)
-            }).collect(),
+                    FeatureBundle::pack(
+                        &feature_binners[start..end],
+                        &all_bins[start..end],
+                        num_rows,
+                    )
+                })
+                .collect(),
         };
 
         Self {
@@ -125,7 +164,10 @@ mod tests {
     #[test]
     fn test_basic_dataset() {
         let labels = Float64Array::from(vec![0.0, 1.0, 0.0, 1.0, 0.0]);
-        let params = DatasetParameters { min_data_in_bin: 1, ..DatasetParameters::default() };
+        let params = DatasetParameters {
+            min_data_in_bin: 1,
+            ..DatasetParameters::default()
+        };
         let ds = Dataset::from_arrow(&make_features(), &labels, None, None, &params);
         assert_eq!(ds.num_rows, 5);
         assert_eq!(ds.feature_binners.len(), 1);
@@ -147,10 +189,16 @@ mod tests {
         let features = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(dict)]).unwrap();
         let labels = Float64Array::from(vec![0.0, 1.0, 0.0, 1.0, 0.0]);
 
-        let params = DatasetParameters { min_data_in_bin: 1, ..DatasetParameters::default() };
+        let params = DatasetParameters {
+            min_data_in_bin: 1,
+            ..DatasetParameters::default()
+        };
         let ds = Dataset::from_arrow(&features, &labels, None, None, &params);
         assert_eq!(ds.feature_binners.len(), 1);
-        assert!(matches!(ds.feature_binners[0], FeatureBinner::Categorical(_)));
+        assert!(matches!(
+            ds.feature_binners[0],
+            FeatureBinner::Categorical(_)
+        ));
         assert_eq!(ds.feature_binners[0].num_bins(), 4); // 3 categories + sentinel
     }
 }

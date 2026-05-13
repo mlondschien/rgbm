@@ -3,13 +3,13 @@
 
 //! Histogram-based gradient and hessian accumulation, and best-split finding.
 
-use rayon::prelude::*;
 use crate::dataset::FeatureBundle;
 use crate::parameters::BoosterParameters;
 use crate::utils::prefetch;
+use rayon::prelude::*;
 
 #[derive(Clone, Default, Debug)]
-#[repr(C)]  // group fields into 16 bytes for optimal SIMD processing
+#[repr(C)] // group fields into 16 bytes for optimal SIMD processing
 pub struct HistogramBin {
     pub sum_gradients: f64,
     pub sum_hessians: f64,
@@ -52,7 +52,7 @@ impl Histograms {
         let num_features = bundles.iter().map(|b| b.count).sum();
         let mut offsets = Vec::with_capacity(num_features + 1);
         let mut is_categorical = Vec::with_capacity(num_features);
-        
+
         let mut offset = 0;
         for bundle in bundles {
             for i in 0..bundle.count {
@@ -70,12 +70,16 @@ impl Histograms {
         }
     }
 
-
     /// Build histograms for all features in a bundle in one pass over row_indices.
     /// One 64-bit load per row replaces up to 8 separate byte loads.
     /// SAFETY: bin values are in 0..num_bins[i] (sentinel is at index num_bins[i] - 1),
     /// histograms are sized num_bins[i].
-    pub fn build_into(bundle: &FeatureBundle, packed_gh: &[[f32; 2]], row_indices: &[u32], bins: &mut [HistogramBin]) {
+    pub fn build_into(
+        bundle: &FeatureBundle,
+        packed_gh: &[[f32; 2]],
+        row_indices: &[u32],
+        bins: &mut [HistogramBin],
+    ) {
         let p0 = bins.as_mut_ptr();
 
         const PREFETCH_DIST: usize = 32;
@@ -97,18 +101,18 @@ impl Histograms {
                         let gh1 = *packed_gh.get_unchecked(i + 1);
                         let pk0 = *bundle.packed_bins.get_unchecked(row0);
                         let pk1 = *bundle.packed_bins.get_unchecked(row1);
-                        
-                        
+
+
                         (*p0.add((pk0 & 0xFF) as usize)).add(gh0);
-                        // (*p1.add(((pk0 >> 8) & 0xFF) as usize)).add(gh0);                                                                                                                                      
+                        // (*p1.add(((pk0 >> 8) & 0xFF) as usize)).add(gh0);
                         // ...
                         // (*p7.add(((pk0 >> 56) & 0xFF) as usize)).add(gh0);
                         $((*$pi.add(((pk0 >> $shift) & 0xFF) as usize)).add(gh0);)*
 
                         (*p0.add((pk1 & 0xFF) as usize)).add(gh1);
                         // (*p1.add(((pk1 >> 8) & 0xFF) as usize)).add(gh1);
-                        // ...                                                                                                                                   
-                        // (*p7.add(((pk1 >> 56) & 0xFF) as usize)).add(gh1); 
+                        // ...
+                        // (*p7.add(((pk1 >> 56) & 0xFF) as usize)).add(gh1);
                         $((*$pi.add(((pk1 >> $shift) & 0xFF) as usize)).add(gh1);)*
                     }
                     i += 2;
@@ -182,12 +186,11 @@ impl Histograms {
         }
     }
 
-
     pub fn build(
         bundles: &[FeatureBundle],
         grad_hess: &[[f32; 2]],
         indices: &[u32],
-        pool: Option<&rayon::ThreadPool>
+        pool: Option<&rayon::ThreadPool>,
     ) -> Self {
         let mut hists = Self::zeros(bundles);
 
@@ -211,7 +214,8 @@ impl Histograms {
                 }
             }
             Some(pool) => pool.install(|| {
-                bundles.par_iter()
+                bundles
+                    .par_iter()
                     .zip(bin_slices)
                     .for_each(|(bundle, local_bins)| {
                         Self::build_into(bundle, grad_hess, indices, local_bins);
@@ -221,7 +225,6 @@ impl Histograms {
 
         hists
     }
-
 
     pub fn subtract(&mut self, other: &Self) {
         debug_assert_eq!(self.bins.len(), other.bins.len());
@@ -254,7 +257,9 @@ impl Histograms {
         if sentinel_bin.sum_hessians == 0.0 {
             // If there's two bins: One sentinel and one regular and no values in the
             // sentinel bin, there's nothing to split.
-            if bins.len() < 3 { return None; }
+            if bins.len() < 3 {
+                return None;
+            }
             // Safe due to the check above.
             for t in 0..bins.len() - 2 {
                 let bin = &bins[t];
@@ -267,15 +272,24 @@ impl Histograms {
                 // to route missing values at predict. Heuristic: Route them to the
                 // "bigger" side.
                 let missing_goes_left = left_hessian > right_hessian;
-                
+
                 evaluate_split(
-                    left_gradient, left_hessian, right_gradient, right_hessian,
-                    missing_goes_left, t, parameters, 
-                    &mut best_score, &mut best_threshold, &mut best_missing_goes_left
+                    left_gradient,
+                    left_hessian,
+                    right_gradient,
+                    right_hessian,
+                    missing_goes_left,
+                    t,
+                    parameters,
+                    &mut best_score,
+                    &mut best_threshold,
+                    &mut best_missing_goes_left,
                 );
             }
         } else {
-            if bins.len() < 2 { return None; }
+            if bins.len() < 2 {
+                return None;
+            }
             // One additional split to check compared to above: All missing values go
             // left, everything else goes right.
             for t in 0..bins.len() - 1 {
@@ -287,9 +301,16 @@ impl Histograms {
                 let right_hessian = total_hessian - left_hessian;
 
                 evaluate_split(
-                    left_gradient, left_hessian, right_gradient, right_hessian,
-                    false, t, parameters, 
-                    &mut best_score, &mut best_threshold, &mut best_missing_goes_left
+                    left_gradient,
+                    left_hessian,
+                    right_gradient,
+                    right_hessian,
+                    false,
+                    t,
+                    parameters,
+                    &mut best_score,
+                    &mut best_threshold,
+                    &mut best_missing_goes_left,
                 );
 
                 // now compute score for missing_goes_left = true.
@@ -299,16 +320,24 @@ impl Histograms {
                 let right_hessian_minus_sentinel = right_hessian - sentinel_bin.sum_hessians;
 
                 evaluate_split(
-                    left_gradient_plus_sentinel, left_hessian_plus_sentinel,
-                    right_gradient_minus_sentinel, right_hessian_minus_sentinel,
-                    true, t, parameters, 
-                    &mut best_score, &mut best_threshold, &mut best_missing_goes_left
+                    left_gradient_plus_sentinel,
+                    left_hessian_plus_sentinel,
+                    right_gradient_minus_sentinel,
+                    right_hessian_minus_sentinel,
+                    true,
+                    t,
+                    parameters,
+                    &mut best_score,
+                    &mut best_threshold,
+                    &mut best_missing_goes_left,
                 );
             }
         }
 
         let gain = best_score - parent_score;
-        if gain <= parameters.min_gain_to_split { return None; }
+        if gain <= parameters.min_gain_to_split {
+            return None;
+        }
 
         Some(SplitInfo {
             gain,
@@ -321,7 +350,7 @@ impl Histograms {
     }
 
     /// Find the best categorical split by sorting bins by gradient ratio.
-    /// 
+    ///
     /// Instead of checking all 2^num_bins subsets, we first sort categories by their
     /// gradient/hessian ratio. Then we only need to check splits between sorted
     /// categories. This is exact according to Fisher, W. D. (1958).
@@ -344,7 +373,9 @@ impl Histograms {
             }
         }
 
-        if categorical_order.len() < 2 { return None; }
+        if categorical_order.len() < 2 {
+            return None;
+        }
 
         // Sort categories to find the optimal contiguous binary partition
         categorical_order.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -354,7 +385,7 @@ impl Histograms {
         let mut best_score = f64::NEG_INFINITY;
         let mut best_threshold = 0usize;
         let mut best_majority_goes_left = false;
-    
+
         for t in 0..categorical_order.len() - 1 {
             let bin = &bins[categorical_order[t].1];
             left_gradient += bin.sum_gradients;
@@ -366,14 +397,23 @@ impl Histograms {
             let majority_goes_left = left_hessian > right_hessian;
 
             evaluate_split(
-                left_gradient, left_hessian, right_gradient, right_hessian,
-                majority_goes_left, t, parameters, 
-                &mut best_score, &mut best_threshold, &mut best_majority_goes_left
+                left_gradient,
+                left_hessian,
+                right_gradient,
+                right_hessian,
+                majority_goes_left,
+                t,
+                parameters,
+                &mut best_score,
+                &mut best_threshold,
+                &mut best_majority_goes_left,
             );
         }
 
         let gain = best_score - parent_score;
-        if gain <= parameters.min_gain_to_split { return None; }
+        if gain <= parameters.min_gain_to_split {
+            return None;
+        }
 
         let mut goes_left = vec![best_majority_goes_left; num_bins];
         for (i, &(_, k)) in categorical_order.iter().enumerate() {
@@ -389,28 +429,47 @@ impl Histograms {
         })
     }
 
-    pub fn find_best_split(&self, total_gradient: f64, total_hessian: f64, parent_score: f64, p: &BoosterParameters, pool: Option<&rayon::ThreadPool>) -> Option<SplitInfo> {
+    pub fn find_best_split(
+        &self,
+        total_gradient: f64,
+        total_hessian: f64,
+        parent_score: f64,
+        p: &BoosterParameters,
+        pool: Option<&rayon::ThreadPool>,
+    ) -> Option<SplitInfo> {
         let num_features = self.is_categorical.len();
         let map_function = |f: usize| {
             let bins = &self.bins[self.offsets[f]..self.offsets[f + 1]];
             let split_opt = if self.is_categorical[f] {
-                Self::find_best_categorical_split(bins, total_gradient, total_hessian, parent_score, p)
+                Self::find_best_categorical_split(
+                    bins,
+                    total_gradient,
+                    total_hessian,
+                    parent_score,
+                    p,
+                )
             } else {
                 Self::find_best_numeric_split(bins, total_gradient, total_hessian, parent_score, p)
             };
-            split_opt.map(|mut s| { s.feature_index = f; s })
+            split_opt.map(|mut s| {
+                s.feature_index = f;
+                s
+            })
         };
         let reduce_function = |a: SplitInfo, b: SplitInfo| if a.gain >= b.gain { a } else { b };
         match pool {
             Some(pool) => pool.install(|| {
-                (0..num_features).into_par_iter().filter_map(map_function).reduce_with(reduce_function)
+                (0..num_features)
+                    .into_par_iter()
+                    .filter_map(map_function)
+                    .reduce_with(reduce_function)
             }),
-            None => (0..num_features).filter_map(map_function).reduce(reduce_function),
+            None => (0..num_features)
+                .filter_map(map_function)
+                .reduce(reduce_function),
         }
     }
 }
-
-
 
 /// Score of a leaf node used for gain calculation.
 /// ///
@@ -420,8 +479,6 @@ pub fn calculate_score(g: f64, h: f64, l1: f64, l2: f64) -> f64 {
     let d = (g.abs() - l1).max(0.0);
     d * d / (h + l2)
 }
-
-
 
 #[inline(always)]
 fn evaluate_split(
@@ -436,13 +493,26 @@ fn evaluate_split(
     best_threshold: &mut usize,
     best_missing_goes_left: &mut bool,
 ) {
-    let score = calculate_score(left_gradient, left_hessian, parameters.lambda_l1, parameters.lambda_l2) 
-              + calculate_score(right_gradient, right_hessian, parameters.lambda_l1, parameters.lambda_l2);
+    let score = calculate_score(
+        left_gradient,
+        left_hessian,
+        parameters.lambda_l1,
+        parameters.lambda_l2,
+    ) + calculate_score(
+        right_gradient,
+        right_hessian,
+        parameters.lambda_l1,
+        parameters.lambda_l2,
+    );
 
-    let leaf_constraint = (left_hessian >= parameters.min_sum_hessian_in_leaf) 
-                        & (right_hessian >= parameters.min_sum_hessian_in_leaf);
-    
-    let score = if leaf_constraint { score } else { f64::NEG_INFINITY };
+    let leaf_constraint = (left_hessian >= parameters.min_sum_hessian_in_leaf)
+        & (right_hessian >= parameters.min_sum_hessian_in_leaf);
+
+    let score = if leaf_constraint {
+        score
+    } else {
+        f64::NEG_INFINITY
+    };
 
     if score > *best_score {
         *best_score = score;

@@ -33,10 +33,20 @@ impl PyDataset {
     ) -> PyResult<Self> {
         let batch = RecordBatch::from_pyarrow_bound(x)?;
         let labels = Float64Array::from(ArrayData::from_pyarrow_bound(y)?);
-        let weights = weights.map(|w| ArrayData::from_pyarrow_bound(w).map(Float64Array::from)).transpose()?;
-        let offsets = offsets.map(|o| ArrayData::from_pyarrow_bound(o).map(Float64Array::from)).transpose()?;
-        let params = DatasetParameters { max_bin, min_data_in_bin, n_jobs, seed };
-        let inner = Dataset::from_arrow(&batch, &labels, weights.as_ref(), offsets.as_ref(), &params);
+        let weights = weights
+            .map(|w| ArrayData::from_pyarrow_bound(w).map(Float64Array::from))
+            .transpose()?;
+        let offsets = offsets
+            .map(|o| ArrayData::from_pyarrow_bound(o).map(Float64Array::from))
+            .transpose()?;
+        let params = DatasetParameters {
+            max_bin,
+            min_data_in_bin,
+            n_jobs,
+            seed,
+        };
+        let inner =
+            Dataset::from_arrow(&batch, &labels, weights.as_ref(), offsets.as_ref(), &params);
         Ok(Self { inner })
     }
 }
@@ -78,19 +88,31 @@ impl PyBooster {
         let obj: Box<dyn Objective> = match objective {
             "gaussian" => Box::new(Gaussian),
             "logistic" => Box::new(Logistic),
-            "probit"   => Box::new(Probit),
-            "poisson"  => Box::new(Poisson),
-            _ => return Err(PyValueError::new_err(format!(
-                "unknown objective '{objective}'; expected one of: gaussian, logistic, probit, poisson"
-            ))),
+            "probit" => Box::new(Probit),
+            "poisson" => Box::new(Poisson),
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown objective '{objective}'; expected one of: gaussian, logistic, probit, poisson"
+                )));
+            }
         };
 
         Ok(Self {
-            booster: Booster::new(BoosterParameters {
-                num_iterations, learning_rate, max_depth,
-                min_sum_hessian_in_leaf, min_gain_to_split,
-                lambda_l1, lambda_l2, max_leaves, leaf_wise, n_jobs,
-            }, obj),
+            booster: Booster::new(
+                BoosterParameters {
+                    num_iterations,
+                    learning_rate,
+                    max_depth,
+                    min_sum_hessian_in_leaf,
+                    min_gain_to_split,
+                    lambda_l1,
+                    lambda_l2,
+                    max_leaves,
+                    leaf_wise,
+                    n_jobs,
+                },
+                obj,
+            ),
         })
     }
 
@@ -104,9 +126,16 @@ impl PyBooster {
     }
 
     #[pyo3(signature = (x, offsets=None))]
-    fn predict(&self, py: Python<'_>, x: &Bound<'_, PyAny>, offsets: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyArray1<f64>>> {
+    fn predict(
+        &self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        offsets: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyArray1<f64>>> {
         let batch = RecordBatch::from_pyarrow_bound(x)?;
-        let offsets = offsets.map(|o| ArrayData::from_pyarrow_bound(o).map(Float64Array::from)).transpose()?;
+        let offsets = offsets
+            .map(|o| ArrayData::from_pyarrow_bound(o).map(Float64Array::from))
+            .transpose()?;
         let result = py.allow_threads(|| self.booster.predict(&batch, offsets.as_ref()));
         Ok(PyArray1::from_slice(py, result.values()).into())
     }

@@ -11,8 +11,8 @@ use ahash::AHashMap;
 use arrow::array::{Array, AsArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Float64Type};
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rand::seq::IteratorRandom;
 
 // Hardcoded so indices fit into u8.
@@ -31,7 +31,10 @@ pub enum FeatureBinner {
 
 impl FeatureBinner {
     pub fn new(array: &dyn Array, max_bin: usize, min_data_in_bin: usize, seed: u64) -> Self {
-        assert!(max_bin <= MAX_NUM_BINS, "max_bin {max_bin} exceeds maximum of {MAX_NUM_BINS}");
+        assert!(
+            max_bin <= MAX_NUM_BINS,
+            "max_bin {max_bin} exceeds maximum of {MAX_NUM_BINS}"
+        );
 
         // Cast Float32 to Float64 and dictionaries with non-Utf8 values to
         // Dict<_, Utf8>, so the match below only handles those two types.
@@ -40,7 +43,11 @@ impl FeatureBinner {
         let casted = match array.data_type() {
             DataType::Float32 => Some(cast(array, &DataType::Float64).unwrap()),
             DataType::Dictionary(k, v) if !matches!(v.as_ref(), DataType::Utf8) => Some(
-                cast(array, &DataType::Dictionary(k.clone(), Box::new(DataType::Utf8))).unwrap(),
+                cast(
+                    array,
+                    &DataType::Dictionary(k.clone(), Box::new(DataType::Utf8)),
+                )
+                .unwrap(),
             ),
             _ => None,
         };
@@ -52,9 +59,12 @@ impl FeatureBinner {
 
                 // For very large datasets, use a subsample of the dataset to determine
                 // bin boundaries.
-                const MAX_SAMPLE: usize = 200_000;  // same as LGBM
+                const MAX_SAMPLE: usize = 200_000; // same as LGBM
                 let mut rng = StdRng::seed_from_u64(seed);
-                let mut valid = values.iter().flatten().filter(|x| !x.is_nan())
+                let mut valid = values
+                    .iter()
+                    .flatten()
+                    .filter(|x| !x.is_nan())
                     .choose_multiple(&mut rng, MAX_SAMPLE);
                 valid.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
@@ -88,7 +98,9 @@ impl FeatureBinner {
                 );
                 FeatureBinner::Categorical(categories)
             }
-            dt => panic!("unsupported feature type {dt:?}; expected Float64, Float32, or Dictionary with Utf8/LargeUtf8/Utf8View values"),
+            dt => panic!(
+                "unsupported feature type {dt:?}; expected Float64, Float32, or Dictionary with Utf8/LargeUtf8/Utf8View values"
+            ),
         }
     }
 
@@ -102,7 +114,11 @@ impl FeatureBinner {
         let casted = match array.data_type() {
             DataType::Float32 => Some(cast(array, &DataType::Float64).unwrap()),
             DataType::Dictionary(k, v) if !matches!(v.as_ref(), DataType::Utf8) => Some(
-                cast(array, &DataType::Dictionary(k.clone(), Box::new(DataType::Utf8))).unwrap(),
+                cast(
+                    array,
+                    &DataType::Dictionary(k.clone(), Box::new(DataType::Utf8)),
+                )
+                .unwrap(),
             ),
             _ => None,
         };
@@ -122,11 +138,19 @@ impl FeatureBinner {
                 // the same. The loop without nulls is much faster.
                 if let Some(nulls) = values.nulls() {
                     for (i, &x) in raw_values.iter().enumerate() {
-                        binned_values.push(if nulls.is_null(i) || x.is_nan() { sentinel } else { upper_bounds.partition_point(|&b| b < x) as u8 });
+                        binned_values.push(if nulls.is_null(i) || x.is_nan() {
+                            sentinel
+                        } else {
+                            upper_bounds.partition_point(|&b| b < x) as u8
+                        });
                     }
                 } else {
                     for &x in raw_values {
-                        binned_values.push(if x.is_nan() { sentinel } else { upper_bounds.partition_point(|&b| b < x) as u8 });
+                        binned_values.push(if x.is_nan() {
+                            sentinel
+                        } else {
+                            upper_bounds.partition_point(|&b| b < x) as u8
+                        });
                     }
                 }
                 binned_values
@@ -153,19 +177,19 @@ impl FeatureBinner {
 
                 let keys = dict.normalized_keys();
                 let mut binned_values = Vec::with_capacity(dict.len());
-                
+
                 // Same as for numericals: Check for nulls outside the main loop.
                 if let Some(nulls) = dict.nulls() {
                     for i in 0..dict.len() {
-                        binned_values.push(if nulls.is_null(i) { 
-                            sentinel 
-                        } else { 
-                            key_to_bin[keys[i] as usize] 
+                        binned_values.push(if nulls.is_null(i) {
+                            sentinel
+                        } else {
+                            key_to_bin[keys[i] as usize]
                         });
                     }
                 } else {
                     for key in keys {
-                        binned_values.push(key_to_bin[key as usize]);
+                        binned_values.push(key_to_bin[key]);
                     }
                 }
                 binned_values
@@ -241,7 +265,6 @@ fn greedy_find_bins(sorted_values: &[f64], max_bin: usize, min_data_in_bin: usiz
     bounds
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,7 +310,6 @@ mod tests {
         assert!((bins[1] as usize) < binner.num_bins());
         // valid value maps to a different bin
         assert_ne!(bins[0], bins[1]);
-
     }
 
     #[test]
@@ -302,8 +324,20 @@ mod tests {
     #[test]
     fn test_float32_via_cast() {
         // f32 input: must give the same bins as the equivalent f64 input.
-        let f32_arr = Float32Array::from(vec![Some(1.0f32), Some(2.0), None, Some(f32::NAN), Some(3.0)]);
-        let f64_arr = Float64Array::from(vec![Some(1.0f64), Some(2.0), None, Some(f64::NAN), Some(3.0)]);
+        let f32_arr = Float32Array::from(vec![
+            Some(1.0f32),
+            Some(2.0),
+            None,
+            Some(f32::NAN),
+            Some(3.0),
+        ]);
+        let f64_arr = Float64Array::from(vec![
+            Some(1.0f64),
+            Some(2.0),
+            None,
+            Some(f64::NAN),
+            Some(3.0),
+        ]);
         let f32_binner = FeatureBinner::new(&f32_arr, 255, 1, 0);
         let f64_binner = FeatureBinner::new(&f64_arr, 255, 1, 0);
         assert_eq!(f32_binner.apply(&f32_arr), f64_binner.apply(&f64_arr));
@@ -329,7 +363,10 @@ mod tests {
 
         let large_binner = FeatureBinner::new(&large_dict, 255, 1, 0);
         let utf8_binner = FeatureBinner::new(&utf8_dict, 255, 1, 0);
-        assert_eq!(large_binner.apply(&large_dict), utf8_binner.apply(&utf8_dict));
+        assert_eq!(
+            large_binner.apply(&large_dict),
+            utf8_binner.apply(&utf8_dict)
+        );
         assert_eq!(large_binner.num_bins(), 4); // 3 categories + sentinel
     }
 

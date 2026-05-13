@@ -7,8 +7,8 @@ use rayon::prelude::*;
 
 use crate::bin::FeatureBinner;
 use crate::dataset::Dataset;
-use crate::parameters::BoosterParameters;
 use crate::objective::Objective;
+use crate::parameters::BoosterParameters;
 use crate::tree::{Tree, TreeWorkspace};
 use crate::utils::build_thread_pool;
 
@@ -41,7 +41,11 @@ impl Booster {
         self.base_score = self.objective.initial_score(labels, weights);
 
         let mut scores: Vec<f64> = match dataset.offsets.as_ref() {
-            Some(offsets) => offsets.values().iter().map(|&o| self.base_score + o).collect(),
+            Some(offsets) => offsets
+                .values()
+                .iter()
+                .map(|&o| self.base_score + o)
+                .collect(),
             None => vec![self.base_score; dataset.num_rows],
         };
         let mut grad_hess = vec![[0.0f32; 2]; dataset.num_rows];
@@ -52,18 +56,33 @@ impl Booster {
         self.trees.clear();
 
         for _ in 0..self.parameters.num_iterations {
-            self.objective.gradient_hessian(labels, &scores, weights, &mut grad_hess, pool.as_ref());
+            self.objective.gradient_hessian(
+                labels,
+                &scores,
+                weights,
+                &mut grad_hess,
+                pool.as_ref(),
+            );
 
             let mut tree = Tree::new(self.parameters.max_leaves);
-            tree.fit(dataset, &grad_hess, &self.parameters, pool.as_ref(), &mut workspace);
+            tree.fit(
+                dataset,
+                &grad_hess,
+                &self.parameters,
+                pool.as_ref(),
+                &mut workspace,
+            );
 
             match &pool {
                 Some(pool) => {
                     let nodes = &tree.nodes;
                     pool.install(|| {
-                        scores.par_iter_mut().zip(workspace.leaf_indices.par_iter()).for_each(|(score, &leaf_idx)| {
-                            *score += nodes[leaf_idx as usize].value();
-                        });
+                        scores
+                            .par_iter_mut()
+                            .zip(workspace.leaf_indices.par_iter())
+                            .for_each(|(score, &leaf_idx)| {
+                                *score += nodes[leaf_idx as usize].value();
+                            });
                     });
                 }
                 None => {
@@ -80,15 +99,26 @@ impl Booster {
     pub fn predict(&self, batch: &RecordBatch, offsets: Option<&Float64Array>) -> Float64Array {
         // Bin every column up-front. FeatureBinner::apply handles Float32 and the
         // various dictionary value types via internal casts.
-        let columns: Vec<Vec<u8>> = self.feature_binners.iter().zip(batch.columns())
+        let columns: Vec<Vec<u8>> = self
+            .feature_binners
+            .iter()
+            .zip(batch.columns())
             .map(|(b, col)| b.apply(col.as_ref()))
             .collect();
         let column_refs: Vec<&[u8]> = columns.iter().map(|c| c.as_slice()).collect();
-        let sentinels: Vec<u8> = self.feature_binners.iter().map(|b| (b.num_bins() - 1) as u8).collect();
+        let sentinels: Vec<u8> = self
+            .feature_binners
+            .iter()
+            .map(|b| (b.num_bins() - 1) as u8)
+            .collect();
 
         let num_rows = batch.num_rows();
         let mut scores: Vec<f64> = match offsets {
-            Some(offsets) => offsets.values().iter().map(|&o| self.base_score + o).collect(),
+            Some(offsets) => offsets
+                .values()
+                .iter()
+                .map(|&o| self.base_score + o)
+                .collect(),
             None => vec![self.base_score; num_rows],
         };
 
@@ -117,34 +147,59 @@ impl Booster {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use arrow::array::Float64Array;
-    use arrow::datatypes::{DataType, Field, Schema};
     use crate::dataset::Dataset;
     use crate::objective::{Gaussian, Logistic, Poisson, Probit};
     use crate::parameters::{BoosterParameters, DatasetParameters};
+    use arrow::array::Float64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
 
     fn make_dataset(x: Vec<f64>, y: Vec<f64>) -> (Dataset, RecordBatch) {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(x))]).unwrap();
         let labels = Float64Array::from(y);
-        let dataset = Dataset::from_arrow(&batch, &labels, None, None, &DatasetParameters { min_data_in_bin: 1, ..DatasetParameters::default() });
+        let dataset = Dataset::from_arrow(
+            &batch,
+            &labels,
+            None,
+            None,
+            &DatasetParameters {
+                min_data_in_bin: 1,
+                ..DatasetParameters::default()
+            },
+        );
         (dataset, batch)
     }
 
     fn test_params() -> BoosterParameters {
-        BoosterParameters { num_iterations: 20, min_sum_hessian_in_leaf: 0.0, ..BoosterParameters::default() }
+        BoosterParameters {
+            num_iterations: 20,
+            min_sum_hessian_in_leaf: 0.0,
+            ..BoosterParameters::default()
+        }
     }
 
     fn mse(preds: &Float64Array, labels: &[f64]) -> f64 {
-        preds.values().iter().zip(labels).map(|(p, y)| (p - y).powi(2)).sum::<f64>() / labels.len() as f64
+        preds
+            .values()
+            .iter()
+            .zip(labels)
+            .map(|(p, y)| (p - y).powi(2))
+            .sum::<f64>()
+            / labels.len() as f64
     }
 
     #[test]
     fn test_base_score_is_mean() {
         let y = vec![0.0, 1.0, 2.0, 3.0];
         let (dataset, _) = make_dataset(vec![0.0, 1.0, 2.0, 3.0], y.clone());
-        let mut booster = Booster::new(BoosterParameters { num_iterations: 0, ..test_params() }, Box::new(Gaussian));
+        let mut booster = Booster::new(
+            BoosterParameters {
+                num_iterations: 0,
+                ..test_params()
+            },
+            Box::new(Gaussian),
+        );
         booster.fit(&dataset);
         assert!((booster.base_score - 1.5).abs() < 1e-10);
     }
@@ -168,31 +223,46 @@ mod tests {
     fn test_fit_probit() {
         let n = 200;
         let x: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
-        let y: Vec<f64> = x.iter().map(|&xi| if xi > 0.5 { 1.0 } else { 0.0 }).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .map(|&xi| if xi > 0.5 { 1.0 } else { 0.0 })
+            .collect();
         let (dataset, batch) = make_dataset(x, y.clone());
 
         let mut booster = Booster::new(test_params(), Box::new(Probit));
         booster.fit(&dataset);
         let preds = booster.predict(&batch, None);
 
-        let correct = preds.values().iter().zip(&y)
+        let correct = preds
+            .values()
+            .iter()
+            .zip(&y)
             .filter(|&(&p, &yi)| (p > 0.5) == (yi > 0.5))
             .count();
         assert!(correct as f64 / n as f64 > 0.95);
     }
 
     fn logloss(preds: &Float64Array, labels: &[f64]) -> f64 {
-        preds.values().iter().zip(labels).map(|(&p, &y)| {
-            let p = p.clamp(1e-15, 1.0 - 1e-15);
-            - (y * p.ln() + (1.0 - y) * (1.0 - p).ln())
-        }).sum::<f64>() / labels.len() as f64
+        preds
+            .values()
+            .iter()
+            .zip(labels)
+            .map(|(&p, &y)| {
+                let p = p.clamp(1e-15, 1.0 - 1e-15);
+                -(y * p.ln() + (1.0 - y) * (1.0 - p).ln())
+            })
+            .sum::<f64>()
+            / labels.len() as f64
     }
 
     #[test]
     fn test_fit_classification_reduces_logloss() {
         let n = 200;
         let x: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
-        let y: Vec<f64> = x.iter().map(|&xi| if xi > 0.5 { 1.0 } else { 0.0 }).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .map(|&xi| if xi > 0.5 { 1.0 } else { 0.0 })
+            .collect();
         let (dataset, batch) = make_dataset(x, y.clone());
 
         let initial_p = y.iter().sum::<f64>() / n as f64;
@@ -206,7 +276,10 @@ mod tests {
         assert!(final_logloss < initial_logloss * 0.1);
 
         // also check accuracy as a sanity check
-        let correct = preds.values().iter().zip(&y)
+        let correct = preds
+            .values()
+            .iter()
+            .zip(&y)
             .filter(|&(&p, &yi)| (p > 0.5) == (yi > 0.5))
             .count();
         assert!(correct as f64 / n as f64 > 0.95);
@@ -218,12 +291,19 @@ mod tests {
         // expand fully at each level and end up with all 4 leaves at depth 2.
         let n = 200;
         let x: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
-        let y: Vec<f64> = x.iter().map(|&xi| if xi > 0.5 { 1.0 } else { 0.0 }).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .map(|&xi| if xi > 0.5 { 1.0 } else { 0.0 })
+            .collect();
         let (dataset, _) = make_dataset(x, y);
 
         let params = BoosterParameters {
-            num_iterations: 1, max_depth: 2, max_leaves: 4, leaf_wise: false,
-            min_sum_hessian_in_leaf: 0.0, ..BoosterParameters::default()
+            num_iterations: 1,
+            max_depth: 2,
+            max_leaves: 4,
+            leaf_wise: false,
+            min_sum_hessian_in_leaf: 0.0,
+            ..BoosterParameters::default()
         };
         let mut booster = Booster::new(params, Box::new(Gaussian));
         booster.fit(&dataset);
@@ -235,7 +315,11 @@ mod tests {
         while let Some((idx, depth)) = stack.pop() {
             match &tree.nodes[idx] {
                 crate::tree::Node::Leaf { .. } => leaf_depths.push(depth),
-                crate::tree::Node::Internal { left_child, right_child, .. } => {
+                crate::tree::Node::Internal {
+                    left_child,
+                    right_child,
+                    ..
+                } => {
                     stack.push((*left_child as usize, depth + 1));
                     stack.push((*right_child as usize, depth + 1));
                 }
@@ -254,7 +338,12 @@ mod tests {
         let true_rate: Vec<f64> = x.iter().map(|&xi| (2.0 * xi - 1.0).exp()).collect();
         // Deterministic "Poisson-like" labels: floor(rate) + parity. Good enough
         // to exercise the loss; we only check that mean(predicted) ≈ mean(true).
-        let y: Vec<f64> = true_rate.iter().enumerate().map(|(i, &r)| r + ((i % 3) as f64 - 1.0) * 0.1).map(|v| v.max(0.0)).collect();
+        let y: Vec<f64> = true_rate
+            .iter()
+            .enumerate()
+            .map(|(i, &r)| r + ((i % 3) as f64 - 1.0) * 0.1)
+            .map(|v| v.max(0.0))
+            .collect();
         let (dataset, batch) = make_dataset(x, y.clone());
 
         let mut booster = Booster::new(test_params(), Box::new(Poisson));
@@ -279,7 +368,10 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(x))]).unwrap();
         let labels = Float64Array::from(y);
-        let params = DatasetParameters { min_data_in_bin: 1, ..DatasetParameters::default() };
+        let params = DatasetParameters {
+            min_data_in_bin: 1,
+            ..DatasetParameters::default()
+        };
 
         // Weight first point heavily
         let weights1 = Float64Array::from(vec![100.0, 1.0]);

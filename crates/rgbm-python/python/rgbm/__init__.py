@@ -73,7 +73,17 @@ class Dataset:
         datasets (>200,000 rows).
     """
 
-    def __init__(self, x, y, weights=None, offsets=None, max_bin=255, min_data_in_bin=3, n_jobs=-1, seed=0):
+    def __init__(
+        self,
+        x,
+        y,
+        weights=None,
+        offsets=None,
+        max_bin=255,
+        min_data_in_bin=3,
+        n_jobs=-1,
+        seed=0,
+    ):
         self._inner = _Dataset(
             _to_record_batch(x),
             _to_array(y),
