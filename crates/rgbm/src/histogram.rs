@@ -533,8 +533,9 @@ fn evaluate_split(
         parameters.lambda_l2,
     );
 
-    let leaf_constraint = (left_hessian >= parameters.min_sum_hessian_in_leaf)
-        & (right_hessian >= parameters.min_sum_hessian_in_leaf);
+    // Same epsilon as LightGBM's kEpsilon.
+    let min_hessian = parameters.min_sum_hessian_in_leaf.max(1e-15);
+    let leaf_constraint = (left_hessian >= min_hessian) & (right_hessian >= min_hessian);
 
     let score = if leaf_constraint {
         score
@@ -546,5 +547,34 @@ fn evaluate_split(
         *best_score = score;
         *best_threshold = threshold_idx;
         *best_missing_goes_left = missing_goes_left;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parameters::BoosterParameters;
+
+    #[test]
+    fn test_zero_hessian_side_is_not_split() {
+        // A side with zero hessian but nonzero gradient must not win with an
+        // unbounded score, even with min_sum_hessian_in_leaf = 0 and lambda_l2 = 0.
+        let bins = vec![
+            HistogramBin {
+                sum_gradients: -5.0,
+                sum_hessians: 0.0,
+            },
+            HistogramBin {
+                sum_gradients: 5.0,
+                sum_hessians: 2.0,
+            },
+            HistogramBin::default(), // empty sentinel bin
+        ];
+        let p = BoosterParameters {
+            min_sum_hessian_in_leaf: 0.0,
+            lambda_l2: 0.0,
+            ..BoosterParameters::default()
+        };
+        assert!(Histograms::find_best_numeric_split(&bins, &p).is_none());
     }
 }
