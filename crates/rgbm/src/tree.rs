@@ -157,9 +157,7 @@ impl Tree {
             if left_len < right_len {
                 let left_indices = &workspace.all_indices[left_start..left_start + left_len];
                 let ordered_grad_hess = &mut workspace.ordered_gh[..left_len];
-                for (out, &row) in ordered_grad_hess.iter_mut().zip(left_indices) {
-                    *out = grad_hess[row as usize];
-                }
+                gather_grad_hess(grad_hess, left_indices, ordered_grad_hess, pool);
                 left_histograms = Histograms::build(
                     &dataset.feature_bundles,
                     ordered_grad_hess,
@@ -171,9 +169,7 @@ impl Tree {
             } else {
                 let right_indices = &workspace.all_indices[right_start..right_start + right_len];
                 let ordered_grad_hess = &mut workspace.ordered_gh[..right_len];
-                for (out, &row) in ordered_grad_hess.iter_mut().zip(right_indices) {
-                    *out = grad_hess[row as usize];
-                }
+                gather_grad_hess(grad_hess, right_indices, ordered_grad_hess, pool);
                 right_histograms = Histograms::build(
                     &dataset.feature_bundles,
                     ordered_grad_hess,
@@ -437,6 +433,28 @@ impl Tree {
         indices[..total_left].copy_from_slice(&left_buffer[..total_left]);
         indices[total_left..].copy_from_slice(&right_buffer[..n - total_left]);
         total_left
+    }
+}
+
+/// Gather `grad_hess[row]` for each row in `indices` into `out`.
+fn gather_grad_hess(
+    grad_hess: &[[f32; 2]],
+    indices: &[u32],
+    out: &mut [[f32; 2]],
+    pool: Option<&rayon::ThreadPool>,
+) {
+    match pool.filter(|_| indices.len() > 2048) {
+        Some(pool) => pool.install(|| {
+            out.par_iter_mut()
+                .zip(indices.par_iter())
+                .with_min_len(1024)
+                .for_each(|(out, &row)| *out = grad_hess[row as usize]);
+        }),
+        None => {
+            for (out, &row) in out.iter_mut().zip(indices) {
+                *out = grad_hess[row as usize];
+            }
+        }
     }
 }
 
