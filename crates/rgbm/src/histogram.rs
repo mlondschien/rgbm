@@ -238,12 +238,19 @@ impl Histograms {
     /// Find the best numeric split by scanning bins left to right.
     pub fn find_best_numeric_split(
         bins: &[HistogramBin],
-        total_gradient: f64,
-        total_hessian: f64,
-        parent_score: f64,
         parameters: &BoosterParameters,
     ) -> Option<SplitInfo> {
         let sentinel_bin = &bins.last().unwrap();
+
+        let (total_gradient, total_hessian) = bins.iter().fold((0.0, 0.0), |(g, h), b| {
+            (g + b.sum_gradients, h + b.sum_hessians)
+        });
+        let parent_score = calculate_score(
+            total_gradient,
+            total_hessian,
+            parameters.lambda_l1,
+            parameters.lambda_l2,
+        );
 
         let mut left_gradient = 0.0;
         let mut left_hessian = 0.0;
@@ -356,12 +363,19 @@ impl Histograms {
     /// categories. This is exact according to Fisher, W. D. (1958).
     pub fn find_best_categorical_split(
         bins: &[HistogramBin],
-        total_gradient: f64,
-        total_hessian: f64,
-        parent_score: f64,
         parameters: &BoosterParameters,
     ) -> Option<SplitInfo> {
         let num_bins = bins.len();
+
+        let (total_gradient, total_hessian) = bins.iter().fold((0.0, 0.0), |(g, h), b| {
+            (g + b.sum_gradients, h + b.sum_hessians)
+        });
+        let parent_score = calculate_score(
+            total_gradient,
+            total_hessian,
+            parameters.lambda_l1,
+            parameters.lambda_l2,
+        );
 
         // We treat missing values as just another category.
         let mut categorical_order: Vec<(f64, usize)> = Vec::with_capacity(num_bins);
@@ -431,9 +445,6 @@ impl Histograms {
 
     pub fn find_best_split(
         &self,
-        total_gradient: f64,
-        total_hessian: f64,
-        parent_score: f64,
         p: &BoosterParameters,
         pool: Option<&rayon::ThreadPool>,
     ) -> Option<SplitInfo> {
@@ -441,15 +452,9 @@ impl Histograms {
         let map_function = |f: usize| {
             let bins = &self.bins[self.offsets[f]..self.offsets[f + 1]];
             let split_opt = if self.is_categorical[f] {
-                Self::find_best_categorical_split(
-                    bins,
-                    total_gradient,
-                    total_hessian,
-                    parent_score,
-                    p,
-                )
+                Self::find_best_categorical_split(bins, p)
             } else {
-                Self::find_best_numeric_split(bins, total_gradient, total_hessian, parent_score, p)
+                Self::find_best_numeric_split(bins, p)
             };
             split_opt.map(|mut s| {
                 s.feature_index = f;

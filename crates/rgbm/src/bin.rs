@@ -241,6 +241,8 @@ fn greedy_find_bins(sorted_values: &[f64], max_bin: usize, min_data_in_bin: usiz
         // Overshoot guard: if adding this value to current bin would exceed mean_size,
         // cut before it.
         // Safe to use value_counts[i - 1] because current_count > 0 implies i >= 1.
+        // Note: ((a + b) / 2.0).next_up could overshoot b for directly adjacent floats.
+        // This is a super edge-case and thus fine.
         if current_count > 0 && (current_count + count) as f64 >= mean_size {
             bounds.push(((value_counts[i - 1].0 + value) / 2.0).next_up());
             current_count = 0;

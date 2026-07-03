@@ -4,7 +4,6 @@
 use rayon::prelude::*;
 
 use crate::dataset::Dataset;
-use crate::histogram::calculate_score;
 use crate::histogram::{Histograms, SplitInfo, Threshold};
 use crate::parameters::BoosterParameters;
 
@@ -285,7 +284,6 @@ impl Tree {
         let (gradient, hessian) = histograms.bins[..end].iter().fold((0.0, 0.0), |(g, h), b| {
             (g + b.sum_gradients, h + b.sum_hessians)
         });
-        let score = calculate_score(gradient, hessian, p.lambda_l1, p.lambda_l2);
         let value = calculate_value(gradient, hessian, p.lambda_l1, p.lambda_l2) * p.learning_rate;
         let node_idx = self.nodes.len();
 
@@ -294,7 +292,7 @@ impl Tree {
         let best_split = if depth >= p.max_depth || hessian < p.min_sum_hessian_in_leaf * 2.0 {
             None
         } else {
-            histograms.find_best_split(gradient, hessian, score, p, pool)
+            histograms.find_best_split(p, pool)
         };
 
         match best_split {
