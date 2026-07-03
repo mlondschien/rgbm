@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use arrow::array::Float64Array;
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use rayon::prelude::*;
 
@@ -97,6 +98,46 @@ impl Booster {
     }
 
     pub fn predict(&self, batch: &RecordBatch, offsets: Option<&Float64Array>) -> Float64Array {
+        // The zip below matches binners to batch columns purely by position, so a
+        // batch whose layout differs from the training data would silently produce
+        // wrong predictions (or panic deep in predict_row). Fail loudly instead.
+        assert!(
+            batch.num_columns() == self.feature_binners.len(),
+            "predict batch has {} columns, but the model was trained with {} features",
+            batch.num_columns(),
+            self.feature_binners.len()
+        );
+        let schema = batch.schema();
+        for (i, (field, binner)) in schema
+            .fields()
+            .iter()
+            .zip(&self.feature_binners)
+            .enumerate()
+        {
+            assert!(
+                field.name() == &self.feature_names[i],
+                "predict batch column {i} is named '{}', but the model was trained with '{}' at this position",
+                field.name(),
+                self.feature_names[i]
+            );
+            let (type_matches, expected) = match binner {
+                FeatureBinner::Numerical(_) => (
+                    matches!(field.data_type(), DataType::Float64 | DataType::Float32),
+                    "Float64 or Float32",
+                ),
+                FeatureBinner::Categorical(_) => (
+                    matches!(field.data_type(), DataType::Dictionary(_, _)),
+                    "a dictionary (categorical) type",
+                ),
+            };
+            assert!(
+                type_matches,
+                "predict batch column '{}' has type {:?}, but the model was trained with {expected}",
+                field.name(),
+                field.data_type()
+            );
+        }
+
         // Bin every column up-front. FeatureBinner::apply handles Float32 and the
         // various dictionary value types via internal casts.
         let columns: Vec<Vec<u8>> = self
@@ -386,6 +427,65 @@ mod tests {
         let mut booster2 = Booster::new(test_params(), Box::new(Gaussian));
         booster2.fit(&ds2);
         assert!(booster2.base_score > 0.9);
+    }
+
+    #[test]
+    #[should_panic(expected = "the model was trained with 1 features")]
+    fn test_predict_wrong_column_count_panics() {
+        let (dataset, _) = make_dataset(vec![0.0, 1.0, 2.0, 3.0], vec![0.0, 1.0, 2.0, 3.0]);
+        let mut booster = Booster::new(test_params(), Box::new(Gaussian));
+        booster.fit(&dataset);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Float64, false),
+            Field::new("y", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Float64Array::from(vec![0.0, 1.0])),
+                Arc::new(Float64Array::from(vec![0.0, 1.0])),
+            ],
+        )
+        .unwrap();
+        booster.predict(&batch, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "the model was trained with 'x' at this position")]
+    fn test_predict_wrong_column_name_panics() {
+        let (dataset, _) = make_dataset(vec![0.0, 1.0, 2.0, 3.0], vec![0.0, 1.0, 2.0, 3.0]);
+        let mut booster = Booster::new(test_params(), Box::new(Gaussian));
+        booster.fit(&dataset);
+
+        let schema = Arc::new(Schema::new(vec![Field::new("y", DataType::Float64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![0.0, 1.0]))])
+                .unwrap();
+        booster.predict(&batch, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "the model was trained with Float64 or Float32")]
+    fn test_predict_wrong_column_type_panics() {
+        use arrow::array::{DictionaryArray, StringArray, UInt32Array};
+        use arrow::datatypes::UInt32Type;
+
+        let (dataset, _) = make_dataset(vec![0.0, 1.0, 2.0, 3.0], vec![0.0, 1.0, 2.0, 3.0]);
+        let mut booster = Booster::new(test_params(), Box::new(Gaussian));
+        booster.fit(&dataset);
+
+        // Same column name, but dictionary-encoded instead of numeric.
+        let keys = UInt32Array::from(vec![0u32, 1]);
+        let values = Arc::new(StringArray::from(vec!["a", "b"]));
+        let dict = DictionaryArray::<UInt32Type>::try_new(keys, values).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(dict)]).unwrap();
+        booster.predict(&batch, None);
     }
 
     #[test]
