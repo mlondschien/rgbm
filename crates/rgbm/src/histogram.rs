@@ -214,11 +214,34 @@ impl Histograms {
                 }
             }
             Some(pool) => pool.install(|| {
+                // Simple parallelziation over rows if there are fewer bundles than
+                // threads. Split rows into chunks so that bundles x chunks ~ threads.
+                let chunks_per_bundle = pool.current_num_threads().div_ceil(bundles.len());
+                let num_chunks = chunks_per_bundle.min(indices.len() / 16_384).max(1);
+                let chunk_size = indices.len().div_ceil(num_chunks);
                 bundles
                     .par_iter()
                     .zip(bin_slices)
                     .for_each(|(bundle, local_bins)| {
-                        Self::build_into(bundle, grad_hess, indices, local_bins);
+                        if chunk_size >= indices.len() {
+                            Self::build_into(bundle, grad_hess, indices, local_bins);
+                            return;
+                        }
+                        let partials: Vec<Vec<HistogramBin>> = indices
+                            .par_chunks(chunk_size)
+                            .zip(grad_hess.par_chunks(chunk_size))
+                            .map(|(idx, gh)| {
+                                let mut partial = vec![HistogramBin::default(); local_bins.len()];
+                                Self::build_into(bundle, gh, idx, &mut partial);
+                                partial
+                            })
+                            .collect();
+                        for partial in partials {
+                            for (bin, p) in local_bins.iter_mut().zip(partial) {
+                                bin.sum_gradients += p.sum_gradients;
+                                bin.sum_hessians += p.sum_hessians;
+                            }
+                        }
                     });
             }),
         }
