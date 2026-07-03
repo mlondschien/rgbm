@@ -477,7 +477,7 @@ impl Histograms {
 }
 
 /// Score of a leaf node used for gain calculation.
-/// ///
+///
 /// Branchless implementation for optimal SIMD performance. See also LGBM implementation
 #[inline(always)]
 pub fn calculate_score(g: f64, h: f64, l1: f64, l2: f64) -> f64 {

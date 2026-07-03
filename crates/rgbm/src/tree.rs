@@ -93,7 +93,7 @@ impl Tree {
             *x = i as u32;
         }
 
-        let mut active_leafs: Vec<ActiveLeaf> = Vec::new();
+        let mut active_leaves: Vec<ActiveLeaf> = Vec::new();
 
         let root_histograms = Histograms::build(
             &dataset.feature_bundles,
@@ -103,7 +103,7 @@ impl Tree {
         );
 
         self.push_leaf(
-            &mut active_leafs,
+            &mut active_leaves,
             &mut workspace.leaf_indices,
             &workspace.all_indices,
             root_histograms,
@@ -115,17 +115,17 @@ impl Tree {
         );
         let mut num_leaves = 1;
 
-        while num_leaves < p.max_leaves && !active_leafs.is_empty() {
+        while num_leaves < p.max_leaves && !active_leaves.is_empty() {
             // Leaf-wise: highest-gain leaf first..
-            // Depth-first: shallowest leaf first, ties broken by highest gain
+            // Depth-wise: shallowest leaf first, ties broken by highest gain
             let (idx, _) = if p.leaf_wise {
-                active_leafs
+                active_leaves
                     .iter()
                     .enumerate()
                     .max_by(|(_, a), (_, b)| a.best_split.gain.total_cmp(&b.best_split.gain))
                     .unwrap()
             } else {
-                active_leafs
+                active_leaves
                     .iter()
                     .enumerate()
                     .min_by(|(_, a), (_, b)| {
@@ -135,7 +135,7 @@ impl Tree {
                     })
                     .unwrap()
             };
-            let leaf = active_leafs.swap_remove(idx);
+            let leaf = active_leaves.swap_remove(idx);
 
             let split_position = self.partition_indices(
                 dataset,
@@ -185,7 +185,7 @@ impl Tree {
             }
 
             let left_node_idx = self.push_leaf(
-                &mut active_leafs,
+                &mut active_leaves,
                 &mut workspace.leaf_indices,
                 &workspace.all_indices,
                 left_histograms,
@@ -196,7 +196,7 @@ impl Tree {
                 pool,
             );
             let right_node_idx = self.push_leaf(
-                &mut active_leafs,
+                &mut active_leaves,
                 &mut workspace.leaf_indices,
                 &workspace.all_indices,
                 right_histograms,
@@ -216,7 +216,7 @@ impl Tree {
             num_leaves += 1;
         }
 
-        for leaf in active_leafs {
+        for leaf in active_leaves {
             for &row in &workspace.all_indices[leaf.start..leaf.start + leaf.len] {
                 workspace.leaf_indices[row as usize] = leaf.leaf_index as u32;
             }
@@ -265,7 +265,7 @@ impl Tree {
 
     fn push_leaf(
         &mut self,
-        active_leafs: &mut Vec<ActiveLeaf>,
+        active_leaves: &mut Vec<ActiveLeaf>,
         leaf_indices: &mut [u32],
         all_indices: &[u32],
         histograms: Histograms,
@@ -296,7 +296,7 @@ impl Tree {
         };
 
         match best_split {
-            Some(best_split) => active_leafs.push(ActiveLeaf {
+            Some(best_split) => active_leaves.push(ActiveLeaf {
                 leaf_index: node_idx,
                 start,
                 len,
@@ -316,7 +316,7 @@ impl Tree {
     /// Separate `indices` into left/right based on split. Indices that belong left go
     /// to the front of `indices`, those that belong right go to the back. Returns the
     /// number of indices that go left. Uses buffers instead of in-place swapping to
-    /// scrambling the order of rows. That is, the indices are ordered within leafs.
+    /// avoid scrambling the order of rows. That is, the indices are ordered within leafs.
     pub fn partition_indices(
         &self,
         dataset: &Dataset,
