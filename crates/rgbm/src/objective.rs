@@ -6,6 +6,10 @@ use rayon::prelude::*;
 /// Objective function for gradient boosting — computes per-row gradients and hessians.
 pub trait Objective: Send + Sync {
     fn lgbm_name(&self) -> &str;
+
+    /// Per-row gradient and hessian.
+    fn grad_hess(&self, label: f64, score: f64, weight: f64) -> [f32; 2];
+
     fn gradient_hessian(
         &self,
         labels: &[f64],
@@ -13,7 +17,23 @@ pub trait Objective: Send + Sync {
         weights: Option<&[f64]>,
         out: &mut [[f32; 2]],
         pool: Option<&rayon::ThreadPool>,
-    );
+    ) {
+        match pool {
+            Some(pool) => pool.install(|| {
+                out.par_iter_mut().enumerate().for_each(|(i, gh)| {
+                    let weight = weights.map_or(1.0, |w| w[i]);
+                    *gh = self.grad_hess(labels[i], scores[i], weight);
+                });
+            }),
+            None => {
+                for (i, gh) in out.iter_mut().enumerate() {
+                    let weight = weights.map_or(1.0, |w| w[i]);
+                    *gh = self.grad_hess(labels[i], scores[i], weight);
+                }
+            }
+        }
+    }
+
     fn initial_score(&self, labels: &[f64], weights: Option<&[f64]>) -> f64;
     fn prediction(&self, score: f64) -> f64;
 }
@@ -24,49 +44,8 @@ impl Objective for Gaussian {
     fn lgbm_name(&self) -> &str {
         "regression"
     }
-    fn gradient_hessian(
-        &self,
-        labels: &[f64],
-        scores: &[f64],
-        weights: Option<&[f64]>,
-        out: &mut [[f32; 2]],
-        pool: Option<&rayon::ThreadPool>,
-    ) {
-        match (pool, weights) {
-            (Some(pool), Some(weights)) => pool.install(|| {
-                out.par_iter_mut()
-                    .zip(labels.par_iter())
-                    .zip(scores.par_iter())
-                    .zip(weights.par_iter())
-                    .for_each(|(((gh, &label), &score), &weight)| {
-                        gh[0] = ((score - label) * weight) as f32;
-                        gh[1] = weight as f32;
-                    });
-            }),
-            (Some(pool), None) => pool.install(|| {
-                out.par_iter_mut()
-                    .zip(labels.par_iter())
-                    .zip(scores.par_iter())
-                    .for_each(|((gh, &label), &score)| {
-                        gh[0] = (score - label) as f32;
-                        gh[1] = 1.0;
-                    });
-            }),
-            (None, Some(weights)) => {
-                for (((gh, &label), &score), &weight) in
-                    out.iter_mut().zip(labels).zip(scores).zip(weights)
-                {
-                    gh[0] = ((score - label) * weight) as f32;
-                    gh[1] = weight as f32;
-                }
-            }
-            (None, None) => {
-                for ((gh, &label), &score) in out.iter_mut().zip(labels).zip(scores) {
-                    gh[0] = (score - label) as f32;
-                    gh[1] = 1.0;
-                }
-            }
-        }
+    fn grad_hess(&self, label: f64, score: f64, weight: f64) -> [f32; 2] {
+        [((score - label) * weight) as f32, weight as f32]
     }
 
     fn initial_score(&self, labels: &[f64], weights: Option<&[f64]>) -> f64 {
@@ -98,53 +77,12 @@ impl Objective for Logistic {
         "binary"
     }
 
-    fn gradient_hessian(
-        &self,
-        labels: &[f64],
-        scores: &[f64],
-        weights: Option<&[f64]>,
-        out: &mut [[f32; 2]],
-        pool: Option<&rayon::ThreadPool>,
-    ) {
-        match (pool, weights) {
-            (Some(pool), Some(weights)) => pool.install(|| {
-                out.par_iter_mut()
-                    .zip(labels.par_iter())
-                    .zip(scores.par_iter())
-                    .zip(weights.par_iter())
-                    .for_each(|(((gh, &label), &score), &weight)| {
-                        let p = 1.0 / (1.0 + (-score).exp());
-                        gh[0] = ((p - label) * weight) as f32;
-                        gh[1] = ((p * (1.0 - p)).max(1e-16) * weight) as f32;
-                    });
-            }),
-            (Some(pool), None) => pool.install(|| {
-                out.par_iter_mut()
-                    .zip(labels.par_iter())
-                    .zip(scores.par_iter())
-                    .for_each(|((gh, &label), &score)| {
-                        let p = 1.0 / (1.0 + (-score).exp());
-                        gh[0] = (p - label) as f32;
-                        gh[1] = (p * (1.0 - p)).max(1e-16) as f32;
-                    });
-            }),
-            (None, Some(weights)) => {
-                for (((gh, &label), &score), &weight) in
-                    out.iter_mut().zip(labels).zip(scores).zip(weights)
-                {
-                    let p = 1.0 / (1.0 + (-score).exp());
-                    gh[0] = ((p - label) * weight) as f32;
-                    gh[1] = ((p * (1.0 - p)).max(1e-16) * weight) as f32;
-                }
-            }
-            (None, None) => {
-                for ((gh, &label), &score) in out.iter_mut().zip(labels).zip(scores) {
-                    let p = 1.0 / (1.0 + (-score).exp());
-                    gh[0] = (p - label) as f32;
-                    gh[1] = (p * (1.0 - p)).max(1e-16) as f32;
-                }
-            }
-        }
+    fn grad_hess(&self, label: f64, score: f64, weight: f64) -> [f32; 2] {
+        let p = 1.0 / (1.0 + (-score).exp());
+        [
+            ((p - label) * weight) as f32,
+            ((p * (1.0 - p)).max(1e-16) * weight) as f32,
+        ]
     }
 
     fn initial_score(&self, labels: &[f64], weights: Option<&[f64]>) -> f64 {
@@ -189,61 +127,14 @@ impl Objective for Probit {
         "binary"
     }
 
-    fn gradient_hessian(
-        &self,
-        labels: &[f64],
-        scores: &[f64],
-        weights: Option<&[f64]>,
-        out: &mut [[f32; 2]],
-        pool: Option<&rayon::ThreadPool>,
-    ) {
-        match (pool, weights) {
-            (Some(pool), Some(weights)) => pool.install(|| {
-                out.par_iter_mut()
-                    .zip(labels.par_iter())
-                    .zip(scores.par_iter())
-                    .zip(weights.par_iter())
-                    .for_each(|(((gh, &label), &score), &weight)| {
-                        let p = Self::norm_cdf(score).clamp(1e-7, 1.0 - 1e-7);
-                        let phi = Self::norm_pdf(score);
-                        let v = p * (1.0 - p);
-                        gh[0] = (phi * (p - label) / v * weight) as f32;
-                        gh[1] = (phi * phi / v * weight).max(1e-16) as f32;
-                    });
-            }),
-            (Some(pool), None) => pool.install(|| {
-                out.par_iter_mut()
-                    .zip(labels.par_iter())
-                    .zip(scores.par_iter())
-                    .for_each(|((gh, &label), &score)| {
-                        let p = Self::norm_cdf(score).clamp(1e-7, 1.0 - 1e-7);
-                        let phi = Self::norm_pdf(score);
-                        let v = p * (1.0 - p);
-                        gh[0] = (phi * (p - label) / v) as f32;
-                        gh[1] = (phi * phi / v).max(1e-16) as f32;
-                    });
-            }),
-            (None, Some(weights)) => {
-                for (((gh, &label), &score), &weight) in
-                    out.iter_mut().zip(labels).zip(scores).zip(weights)
-                {
-                    let p = Self::norm_cdf(score).clamp(1e-7, 1.0 - 1e-7);
-                    let phi = Self::norm_pdf(score);
-                    let v = p * (1.0 - p);
-                    gh[0] = (phi * (p - label) / v * weight) as f32;
-                    gh[1] = (phi * phi / v * weight).max(1e-16) as f32;
-                }
-            }
-            (None, None) => {
-                for ((gh, &label), &score) in out.iter_mut().zip(labels).zip(scores) {
-                    let p = Self::norm_cdf(score).clamp(1e-7, 1.0 - 1e-7);
-                    let phi = Self::norm_pdf(score);
-                    let v = p * (1.0 - p);
-                    gh[0] = (phi * (p - label) / v) as f32;
-                    gh[1] = (phi * phi / v).max(1e-16) as f32;
-                }
-            }
-        }
+    fn grad_hess(&self, label: f64, score: f64, weight: f64) -> [f32; 2] {
+        let p = Self::norm_cdf(score).clamp(1e-7, 1.0 - 1e-7);
+        let phi = Self::norm_pdf(score);
+        let v = p * (1.0 - p);
+        [
+            (phi * (p - label) / v * weight) as f32,
+            (phi * phi / v * weight).max(1e-16) as f32,
+        ]
     }
 
     /// Inverse cdf not implemented in libm. Possibly todo via newton's method.
@@ -265,53 +156,12 @@ impl Objective for Poisson {
         "poisson"
     }
 
-    fn gradient_hessian(
-        &self,
-        labels: &[f64],
-        scores: &[f64],
-        weights: Option<&[f64]>,
-        out: &mut [[f32; 2]],
-        pool: Option<&rayon::ThreadPool>,
-    ) {
-        match (pool, weights) {
-            (Some(pool), Some(weights)) => pool.install(|| {
-                out.par_iter_mut()
-                    .zip(labels.par_iter())
-                    .zip(scores.par_iter())
-                    .zip(weights.par_iter())
-                    .for_each(|(((gh, &label), &score), &weight)| {
-                        let lambda = score.exp().min(1e30);
-                        gh[0] = ((lambda - label) * weight) as f32;
-                        gh[1] = (lambda * weight).max(1e-16) as f32;
-                    });
-            }),
-            (Some(pool), None) => pool.install(|| {
-                out.par_iter_mut()
-                    .zip(labels.par_iter())
-                    .zip(scores.par_iter())
-                    .for_each(|((gh, &label), &score)| {
-                        let lambda = score.exp().min(1e30);
-                        gh[0] = (lambda - label) as f32;
-                        gh[1] = lambda.max(1e-16) as f32;
-                    });
-            }),
-            (None, Some(weights)) => {
-                for (((gh, &label), &score), &weight) in
-                    out.iter_mut().zip(labels).zip(scores).zip(weights)
-                {
-                    let lambda = score.exp().min(1e30);
-                    gh[0] = ((lambda - label) * weight) as f32;
-                    gh[1] = (lambda * weight).max(1e-16) as f32;
-                }
-            }
-            (None, None) => {
-                for ((gh, &label), &score) in out.iter_mut().zip(labels).zip(scores) {
-                    let lambda = score.exp().min(1e30);
-                    gh[0] = (lambda - label) as f32;
-                    gh[1] = lambda.max(1e-16) as f32;
-                }
-            }
-        }
+    fn grad_hess(&self, label: f64, score: f64, weight: f64) -> [f32; 2] {
+        let lambda = score.exp().min(1e30);
+        [
+            ((lambda - label) * weight) as f32,
+            (lambda * weight).max(1e-16) as f32,
+        ]
     }
 
     fn initial_score(&self, labels: &[f64], weights: Option<&[f64]>) -> f64 {
