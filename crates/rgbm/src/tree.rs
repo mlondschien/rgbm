@@ -102,11 +102,17 @@ impl Tree {
             pool,
         );
 
+        let (root_gradient, root_hessian) = grad_hess.iter().fold((0.0, 0.0), |(g, h), gh| {
+            (g + gh[0] as f64, h + gh[1] as f64)
+        });
+
         self.push_leaf(
             &mut active_leaves,
             &mut workspace.leaf_indices,
             &workspace.all_indices,
-            root_histograms,
+            Some(root_histograms),
+            root_gradient,
+            root_hessian,
             0,
             dataset.num_rows,
             0,
@@ -152,39 +158,51 @@ impl Tree {
             let right_start = leaf.start + split_position;
             let right_len = leaf.len - split_position;
 
+            // Skip building histograms if neither child can be split further.
+            let min_hessian = p.min_sum_hessian_in_leaf * 2.0;
+            let both_terminal = leaf.depth + 1 >= p.max_depth
+                || num_leaves + 1 >= p.max_leaves
+                || (leaf.best_split.left_hessian < min_hessian
+                    && leaf.best_split.right_hessian < min_hessian);
+
             // Build the smaller child directly, derive the larger by subtracting
-            let (mut left_histograms, mut right_histograms);
-            if left_len < right_len {
+            let (left_histograms, right_histograms) = if both_terminal {
+                (None, None)
+            } else if left_len < right_len {
                 let left_indices = &workspace.all_indices[left_start..left_start + left_len];
                 let ordered_grad_hess = &mut workspace.ordered_gh[..left_len];
                 gather_grad_hess(grad_hess, left_indices, ordered_grad_hess, pool);
-                left_histograms = Histograms::build(
+                let left_histograms = Histograms::build(
                     &dataset.feature_bundles,
                     ordered_grad_hess,
                     left_indices,
                     pool,
                 );
-                right_histograms = leaf.histograms;
+                let mut right_histograms = leaf.histograms;
                 right_histograms.subtract(&left_histograms);
+                (Some(left_histograms), Some(right_histograms))
             } else {
                 let right_indices = &workspace.all_indices[right_start..right_start + right_len];
                 let ordered_grad_hess = &mut workspace.ordered_gh[..right_len];
                 gather_grad_hess(grad_hess, right_indices, ordered_grad_hess, pool);
-                right_histograms = Histograms::build(
+                let right_histograms = Histograms::build(
                     &dataset.feature_bundles,
                     ordered_grad_hess,
                     right_indices,
                     pool,
                 );
-                left_histograms = leaf.histograms;
+                let mut left_histograms = leaf.histograms;
                 left_histograms.subtract(&right_histograms);
-            }
+                (Some(left_histograms), Some(right_histograms))
+            };
 
             let left_node_idx = self.push_leaf(
                 &mut active_leaves,
                 &mut workspace.leaf_indices,
                 &workspace.all_indices,
                 left_histograms,
+                leaf.best_split.left_gradient,
+                leaf.best_split.left_hessian,
                 left_start,
                 left_len,
                 leaf.depth + 1,
@@ -196,6 +214,8 @@ impl Tree {
                 &mut workspace.leaf_indices,
                 &workspace.all_indices,
                 right_histograms,
+                leaf.best_split.right_gradient,
+                leaf.best_split.right_hessian,
                 right_start,
                 right_len,
                 leaf.depth + 1,
@@ -264,35 +284,33 @@ impl Tree {
         active_leaves: &mut Vec<ActiveLeaf>,
         leaf_indices: &mut [u32],
         all_indices: &[u32],
-        histograms: Histograms,
+        histograms: Option<Histograms>,
+        gradient: f64,
+        hessian: f64,
         start: usize,
         len: usize,
         depth: usize,
         p: &BoosterParameters,
         pool: Option<&rayon::ThreadPool>,
     ) -> usize {
-        // This returns 0 if there's no features.
-        let end = histograms
-            .offsets
-            .get(1)
-            .copied()
-            .unwrap_or(histograms.bins.len());
-        let (gradient, hessian) = histograms.bins[..end].iter().fold((0.0, 0.0), |(g, h), b| {
-            (g + b.sum_gradients, h + b.sum_hessians)
-        });
         let value = calculate_value(gradient, hessian, p.lambda_l1, p.lambda_l2) * p.learning_rate;
         let node_idx = self.nodes.len();
 
         self.nodes.push(Node::Leaf { value });
 
-        let best_split = if depth >= p.max_depth || hessian < p.min_sum_hessian_in_leaf * 2.0 {
-            None
-        } else {
-            histograms.find_best_split(p, pool)
+        let best_split = match histograms {
+            Some(histograms)
+                if depth < p.max_depth && hessian >= p.min_sum_hessian_in_leaf * 2.0 =>
+            {
+                histograms
+                    .find_best_split(p, pool)
+                    .map(|best_split| (histograms, best_split))
+            }
+            _ => None,
         };
 
         match best_split {
-            Some(best_split) => active_leaves.push(ActiveLeaf {
+            Some((histograms, best_split)) => active_leaves.push(ActiveLeaf {
                 leaf_index: node_idx,
                 start,
                 len,
@@ -459,7 +477,7 @@ fn gather_grad_hess(
 }
 
 #[inline(always)]
-pub fn calculate_value(g: f64, h: f64, l1: f64, l2: f64) -> f64 {
+fn calculate_value(g: f64, h: f64, l1: f64, l2: f64) -> f64 {
     if l1 == 0.0 {
         -g / (h + l2)
     } else {
@@ -579,6 +597,10 @@ mod tests {
                 missing_goes_left: false,
             },
             feature_index: 0,
+            left_gradient: 0.0,
+            left_hessian: 0.0,
+            right_gradient: 0.0,
+            right_hessian: 0.0,
         };
 
         let tree = Tree::new(1);
