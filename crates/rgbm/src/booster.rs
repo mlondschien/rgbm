@@ -10,7 +10,7 @@ use crate::bin::FeatureBinner;
 use crate::dataset::Dataset;
 use crate::objective::Objective;
 use crate::parameters::BoosterParameters;
-use crate::tree::{Tree, TreeWorkspace};
+use crate::tree::Tree;
 use crate::utils::build_thread_pool;
 
 pub struct Booster {
@@ -50,7 +50,6 @@ impl Booster {
             None => vec![self.base_score; dataset.num_rows],
         };
         let mut grad_hess = vec![[0.0f32; 2]; dataset.num_rows];
-        let mut workspace = TreeWorkspace::new(dataset.num_rows);
 
         let pool = build_thread_pool(self.parameters.n_jobs);
 
@@ -66,28 +65,21 @@ impl Booster {
             );
 
             let mut tree = Tree::new(self.parameters.max_leaves);
-            tree.fit(
-                dataset,
-                &grad_hess,
-                &self.parameters,
-                pool.as_ref(),
-                &mut workspace,
-            );
+            let leaf_indices = tree.fit(dataset, &grad_hess, &self.parameters, pool.as_ref());
 
             match &pool {
                 Some(pool) => {
                     let nodes = &tree.nodes;
                     pool.install(|| {
-                        scores
-                            .par_iter_mut()
-                            .zip(workspace.leaf_indices.par_iter())
-                            .for_each(|(score, &leaf_idx)| {
+                        scores.par_iter_mut().zip(leaf_indices.par_iter()).for_each(
+                            |(score, &leaf_idx)| {
                                 *score += nodes[leaf_idx as usize].value();
-                            });
+                            },
+                        );
                     });
                 }
                 None => {
-                    for (score, &leaf_idx) in scores.iter_mut().zip(&workspace.leaf_indices) {
+                    for (score, &leaf_idx) in scores.iter_mut().zip(&leaf_indices) {
                         *score += tree.nodes[leaf_idx as usize].value();
                     }
                 }
