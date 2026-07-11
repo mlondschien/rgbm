@@ -37,6 +37,54 @@ pub struct SplitInfo {
     pub gain: f64,
     pub threshold: Threshold,
     pub feature_index: usize,
+    /// Required to decide whether to split further and which leaf values to assign
+    pub left_gradient: f64,
+    pub left_hessian: f64,
+    pub right_gradient: f64,
+    pub right_hessian: f64,
+}
+
+/// Best candidate while scanning a feature's bins.
+#[derive(Default)]
+struct BestSplit {
+    score: f64,
+    position: u8, // numeric: bin index / cat: position in ratio-sorted order
+    missing_goes_left: bool,
+    left_gradient: f64,
+    left_hessian: f64,
+    right_gradient: f64,
+    right_hessian: f64,
+}
+
+impl BestSplit {
+    /// Update if candidate split scores higher and satisfies constraints.
+    #[inline(always)]
+    fn update(
+        &mut self,
+        left_gradient: f64,
+        left_hessian: f64,
+        right_gradient: f64,
+        right_hessian: f64,
+        missing_goes_left: bool,
+        position: usize,
+        p: &BoosterParameters,
+    ) {
+        let score = calculate_score(left_gradient, left_hessian, p.lambda_l1, p.lambda_l2)
+            + calculate_score(right_gradient, right_hessian, p.lambda_l1, p.lambda_l2);
+        // Same epsilon 1e-15 as LightGBM's kEpsilon.
+        let min_hessian = p.min_sum_hessian_in_leaf.max(1e-15);
+        if (left_hessian >= min_hessian) & (right_hessian >= min_hessian) & (score > self.score) {
+            *self = Self {
+                score,
+                position: position as u8,
+                missing_goes_left,
+                left_gradient,
+                left_hessian,
+                right_gradient,
+                right_hessian,
+            };
+        }
+    }
 }
 
 pub struct Histograms {
@@ -278,9 +326,10 @@ impl Histograms {
         let mut left_gradient = 0.0;
         let mut left_hessian = 0.0;
 
-        let mut best_score = f64::NEG_INFINITY;
-        let mut best_threshold = 0usize;
-        let mut best_missing_goes_left = false;
+        let mut best = BestSplit {
+            score: f64::NEG_INFINITY,
+            ..Default::default()
+        };
 
         // Code duplication: Two loops with the same gain calculation but with the
         // branch on the outside.
@@ -303,7 +352,7 @@ impl Histograms {
                 // "bigger" side.
                 let missing_goes_left = left_hessian > right_hessian;
 
-                evaluate_split(
+                best.update(
                     left_gradient,
                     left_hessian,
                     right_gradient,
@@ -311,9 +360,6 @@ impl Histograms {
                     missing_goes_left,
                     t,
                     parameters,
-                    &mut best_score,
-                    &mut best_threshold,
-                    &mut best_missing_goes_left,
                 );
             }
         } else {
@@ -330,7 +376,7 @@ impl Histograms {
                 let right_gradient = total_gradient - left_gradient;
                 let right_hessian = total_hessian - left_hessian;
 
-                evaluate_split(
+                best.update(
                     left_gradient,
                     left_hessian,
                     right_gradient,
@@ -338,9 +384,6 @@ impl Histograms {
                     false,
                     t,
                     parameters,
-                    &mut best_score,
-                    &mut best_threshold,
-                    &mut best_missing_goes_left,
                 );
 
                 // now compute score for missing_goes_left = true.
@@ -349,7 +392,7 @@ impl Histograms {
                 let right_gradient_minus_sentinel = right_gradient - sentinel_bin.sum_gradients;
                 let right_hessian_minus_sentinel = right_hessian - sentinel_bin.sum_hessians;
 
-                evaluate_split(
+                best.update(
                     left_gradient_plus_sentinel,
                     left_hessian_plus_sentinel,
                     right_gradient_minus_sentinel,
@@ -357,14 +400,11 @@ impl Histograms {
                     true,
                     t,
                     parameters,
-                    &mut best_score,
-                    &mut best_threshold,
-                    &mut best_missing_goes_left,
                 );
             }
         }
 
-        let gain = best_score - parent_score;
+        let gain = best.score - parent_score;
         if gain <= parameters.min_gain_to_split {
             return None;
         }
@@ -372,10 +412,14 @@ impl Histograms {
         Some(SplitInfo {
             gain,
             threshold: Threshold::Numeric {
-                bin: best_threshold as u8,
-                missing_goes_left: best_missing_goes_left,
+                bin: best.position,
+                missing_goes_left: best.missing_goes_left,
             },
-            feature_index: 0, // to be filled in by caller
+            feature_index: 0, // to be filled in later
+            left_gradient: best.left_gradient,
+            left_hessian: best.left_hessian,
+            right_gradient: best.right_gradient,
+            right_hessian: best.right_hessian,
         })
     }
 
@@ -419,9 +463,10 @@ impl Histograms {
 
         let mut left_gradient = 0.0;
         let mut left_hessian = 0.0;
-        let mut best_score = f64::NEG_INFINITY;
-        let mut best_threshold = 0usize;
-        let mut best_majority_goes_left = false;
+        let mut best = BestSplit {
+            score: f64::NEG_INFINITY,
+            ..Default::default()
+        };
 
         for t in 0..categorical_order.len() - 1 {
             let bin = &bins[categorical_order[t].1];
@@ -433,7 +478,7 @@ impl Histograms {
 
             let majority_goes_left = left_hessian > right_hessian;
 
-            evaluate_split(
+            best.update(
                 left_gradient,
                 left_hessian,
                 right_gradient,
@@ -441,28 +486,28 @@ impl Histograms {
                 majority_goes_left,
                 t,
                 parameters,
-                &mut best_score,
-                &mut best_threshold,
-                &mut best_majority_goes_left,
             );
         }
 
-        let gain = best_score - parent_score;
+        let gain = best.score - parent_score;
         if gain <= parameters.min_gain_to_split {
             return None;
         }
 
-        let mut goes_left = vec![best_majority_goes_left; num_bins];
+        // best.missing_goes_left holds the majority side, routing bins with zero
+        // hessian (absent from categorical_order).
+        let mut goes_left = vec![best.missing_goes_left; num_bins];
         for (i, &(_, k)) in categorical_order.iter().enumerate() {
-            goes_left[k] = i <= best_threshold;
+            goes_left[k] = i <= best.position as usize;
         }
-        // The sentinel/missing bin sits at num_bins - 1; its slot in `goes_left`
-        // is the source of truth for missing-value routing.
-
         Some(SplitInfo {
             gain,
             threshold: Threshold::Categorical(goes_left),
-            feature_index: 0, // to be filled in by caller
+            feature_index: 0, // to be filled in later
+            left_gradient: best.left_gradient,
+            left_hessian: best.left_hessian,
+            right_gradient: best.right_gradient,
+            right_hessian: best.right_hessian,
         })
     }
 
@@ -503,51 +548,9 @@ impl Histograms {
 ///
 /// Branchless implementation for optimal SIMD performance. See also LGBM implementation
 #[inline(always)]
-pub fn calculate_score(g: f64, h: f64, l1: f64, l2: f64) -> f64 {
+fn calculate_score(g: f64, h: f64, l1: f64, l2: f64) -> f64 {
     let d = (g.abs() - l1).max(0.0);
     d * d / (h + l2)
-}
-
-#[inline(always)]
-fn evaluate_split(
-    left_gradient: f64,
-    left_hessian: f64,
-    right_gradient: f64,
-    right_hessian: f64,
-    missing_goes_left: bool,
-    threshold_idx: usize,
-    parameters: &BoosterParameters,
-    best_score: &mut f64,
-    best_threshold: &mut usize,
-    best_missing_goes_left: &mut bool,
-) {
-    let score = calculate_score(
-        left_gradient,
-        left_hessian,
-        parameters.lambda_l1,
-        parameters.lambda_l2,
-    ) + calculate_score(
-        right_gradient,
-        right_hessian,
-        parameters.lambda_l1,
-        parameters.lambda_l2,
-    );
-
-    // Same epsilon as LightGBM's kEpsilon.
-    let min_hessian = parameters.min_sum_hessian_in_leaf.max(1e-15);
-    let leaf_constraint = (left_hessian >= min_hessian) & (right_hessian >= min_hessian);
-
-    let score = if leaf_constraint {
-        score
-    } else {
-        f64::NEG_INFINITY
-    };
-
-    if score > *best_score {
-        *best_score = score;
-        *best_threshold = threshold_idx;
-        *best_missing_goes_left = missing_goes_left;
-    }
 }
 
 #[cfg(test)]
